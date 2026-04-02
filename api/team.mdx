@@ -1,0 +1,338 @@
+---
+title: "Team"
+description: "Coordinates a named group of agents with shared messaging, task queuing, and optional shared memory."
+---
+
+A `Team` is the central coordination object for a group of cooperating agents. It owns the agent roster, the inter-agent `MessageBus`, an internal `TaskQueue`, and (optionally) a `SharedMemory` instance. An event bus lets orchestrators react to lifecycle milestones without polling.
+
+Teams are typically created via [`OpenMultiAgent.createTeam()`](/api/orchestrator) but can also be instantiated directly.
+
+## Constructor
+
+```typescript
+new Team(config: TeamConfig)
+```
+
+<ParamField body="config" type="TeamConfig" required>
+  Static configuration for the team.
+
+  <Expandable title="TeamConfig fields">
+    <ParamField body="name" type="string" required>
+      Unique display name for the team. Stored on `team.name`.
+    </ParamField>
+
+    <ParamField body="agents" type="readonly AgentConfig[]" required>
+      Ordered list of agent configurations that make up the team roster. Each agent is indexed by its `name` for O(1) lookup. See [AgentConfig](/api/agent#agentconfig) for the full field reference.
+    </ParamField>
+
+    <ParamField body="sharedMemory" type="boolean" default="false">
+      When `true`, a `SharedMemory` instance is created and accessible to all agents via `getSharedMemory()`. Results written to shared memory are injected into subsequent agent prompts automatically during orchestrated runs.
+    </ParamField>
+
+    <ParamField body="maxConcurrency" type="number">
+      Hint for the maximum number of tasks this team should run in parallel. The orchestrator reads this field when building an `AgentPool`; it does not directly throttle `Team` methods.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Properties
+
+<ResponseField name="name" type="string" required>
+  The team's unique display name, taken from `config.name`.
+</ResponseField>
+
+<ResponseField name="config" type="TeamConfig" required>
+  The original configuration object passed to the constructor.
+</ResponseField>
+
+## Agent roster methods
+
+### getAgents
+
+```typescript
+getAgents(): AgentConfig[]
+```
+
+Returns a shallow copy of the agent config array in registration order.
+
+---
+
+### getAgent
+
+```typescript
+getAgent(name: string): AgentConfig | undefined
+```
+
+Look up a single agent config by name. Returns `undefined` when the name is not found.
+
+## Messaging methods
+
+The team wraps an internal `MessageBus` and re-exposes three messaging primitives.
+
+### sendMessage
+
+```typescript
+sendMessage(from: string, to: string, content: string): void
+```
+
+Send a point-to-point message between agents. The message is persisted on the bus and any active subscribers for `to` are notified synchronously. Also emits a `'message'` event on the team's event bus.
+
+---
+
+### getMessages
+
+```typescript
+getMessages(agentName: string): Message[]
+```
+
+Returns every message (read and unread) addressed to `agentName`, in chronological order.
+
+---
+
+### broadcast
+
+```typescript
+broadcast(from: string, content: string): void
+```
+
+Broadcast `content` from `from` to every other agent. The `to` field of the resulting `Message` is `'*'`. Also emits a `'broadcast'` event on the team's event bus.
+
+### Message type
+
+<ResponseField name="id" type="string" required>
+  Stable UUID generated at send time.
+</ResponseField>
+
+<ResponseField name="from" type="string" required>
+  Name of the sending agent.
+</ResponseField>
+
+<ResponseField name="to" type="string" required>
+  Recipient agent name, or `'*'` for a broadcast intended for every agent except the sender.
+</ResponseField>
+
+<ResponseField name="content" type="string" required>
+  The message body.
+</ResponseField>
+
+<ResponseField name="timestamp" type="Date" required>
+  Wall-clock time when the message was created.
+</ResponseField>
+
+## Task management methods
+
+### addTask
+
+```typescript
+addTask(task: Omit<Task, 'id' | 'createdAt' | 'updatedAt'>): Task
+```
+
+Create a task, add it to the internal queue, and return the persisted `Task` with its generated `id`, `createdAt`, and `updatedAt` fields.
+
+---
+
+### getTasks
+
+```typescript
+getTasks(): Task[]
+```
+
+Returns a snapshot of all tasks in the queue regardless of status.
+
+---
+
+### getTasksByAssignee
+
+```typescript
+getTasksByAssignee(agentName: string): Task[]
+```
+
+Returns all tasks whose `assignee` matches `agentName`.
+
+---
+
+### updateTask
+
+```typescript
+updateTask(taskId: string, update: Partial<Task>): Task
+```
+
+Apply a partial update (status, result, or assignee) to an existing task. Throws if the task ID is not found.
+
+---
+
+### getNextTask
+
+```typescript
+getNextTask(agentName: string): Task | undefined
+```
+
+Return the next `'pending'` task for `agentName` that has all its dependencies satisfied. Prefers tasks explicitly assigned to the agent, then falls back to the first unassigned pending task. Returns `undefined` when no ready task exists.
+
+## Memory methods
+
+### getSharedMemory
+
+```typescript
+getSharedMemory(): MemoryStore | undefined
+```
+
+Returns the shared `MemoryStore` for this team, or `undefined` when `sharedMemory` was not enabled in `TeamConfig`. The returned value satisfies the `MemoryStore` interface with `get`, `set`, `list`, `delete`, and `clear` async methods.
+
+---
+
+### getSharedMemoryInstance
+
+```typescript
+getSharedMemoryInstance(): SharedMemory | undefined
+```
+
+Returns the raw internal `SharedMemory` instance. Use this when you need namespaced writes or the `getSummary()` feature. Marked `@internal` — prefer `getSharedMemory()` in application code.
+
+## Event bus methods
+
+### on
+
+```typescript
+on(event: string, handler: (data: unknown) => void): () => void
+```
+
+Subscribe to a team lifecycle event. Returns an unsubscribe function; calling it is idempotent.
+
+Built-in event names:
+
+| Event name       | When emitted                                              |
+| ---------------- | --------------------------------------------------------- |
+| `task:ready`     | A task transitions to `'pending'` with dependencies met. |
+| `task:complete`  | A task completes successfully.                           |
+| `task:failed`    | A task fails.                                            |
+| `all:complete`   | Every task in the queue has reached a terminal state.    |
+| `message`        | A point-to-point message is sent.                        |
+| `broadcast`      | A broadcast message is sent.                             |
+
+Cast `data` to `OrchestratorEvent` for structured access:
+
+```typescript
+const off = team.on('task:complete', (data) => {
+  const event = data as OrchestratorEvent
+  console.log('Completed task:', event.task)
+})
+
+// Later…
+off()
+```
+
+---
+
+### emit
+
+```typescript
+emit(event: string, data: unknown): void
+```
+
+Emit a custom event on the team's event bus. Use this to signal domain-specific milestones (e.g. `'phase:research:complete'`) without modifying the `Team` class.
+
+## MessageBus
+
+`MessageBus` is the internal pub/sub engine used by `Team`. It can also be instantiated and used standalone.
+
+```typescript
+import { MessageBus } from '@jackchen_me/open-multi-agent'
+```
+
+### MessageBus methods
+
+```typescript
+// Send a point-to-point message
+send(from: string, to: string, content: string): Message
+
+// Broadcast to all other agents (to === '*')
+broadcast(from: string, content: string): Message
+
+// Retrieve unread messages for an agent
+getUnread(agentName: string): Message[]
+
+// Retrieve all messages (read + unread) for an agent
+getAll(agentName: string): Message[]
+
+// Mark messages as read
+markRead(agentName: string, messageIds: string[]): void
+
+// Retrieve the conversation history between two agents
+getConversation(agent1: string, agent2: string): Message[]
+
+// Subscribe to new messages addressed to an agent
+subscribe(agentName: string, callback: (message: Message) => void): () => void
+```
+
+## Complete example
+
+```typescript
+import { Team } from '@jackchen_me/open-multi-agent'
+
+const team = new Team({
+  name: 'research-team',
+  agents: [
+    {
+      name: 'researcher',
+      model: 'claude-opus-4-6',
+      systemPrompt: 'You are a rigorous research assistant.',
+    },
+    {
+      name: 'writer',
+      model: 'claude-opus-4-6',
+      systemPrompt: 'You are a technical writer.',
+    },
+  ],
+  sharedMemory: true,
+  maxConcurrency: 2,
+})
+
+// Subscribe to task lifecycle events
+const off = team.on('task:complete', (data) => {
+  const event = data as import('open-multi-agent').OrchestratorEvent
+  console.log(`Task ${event.task} completed`)
+})
+
+// Manually add tasks to the queue
+const t1 = team.addTask({
+  title: 'Research topic',
+  description: 'Gather background on quantum computing advances in 2025.',
+  status: 'pending',
+  assignee: 'researcher',
+})
+
+const t2 = team.addTask({
+  title: 'Draft article',
+  description: 'Write a 400-word article based on the research notes.',
+  status: 'pending',
+  assignee: 'writer',
+  dependsOn: [t1.id],
+})
+
+// Inter-agent messaging
+team.sendMessage('researcher', 'writer', 'Focus on room-temperature superconductors.')
+const messages = team.getMessages('writer')
+console.log(messages[0]?.content)
+
+// Access shared memory
+const store = team.getSharedMemory()
+await store?.set('researcher:notes', 'Key finding: …')
+const entry = await store?.get('researcher:notes')
+console.log(entry?.value)
+
+// Broadcast to all agents
+team.broadcast('coordinator', 'Deadline is in 2 hours.')
+
+// Unsubscribe from events
+off()
+```
+
+<CardGroup cols={2}>
+  <Card title="OpenMultiAgent" icon="sitemap" href="/api/orchestrator">
+    Top-level orchestrator that creates and runs teams.
+  </Card>
+  <Card title="Agent & AgentPool" icon="robot" href="/api/agent">
+    Individual agent execution and concurrency primitives.
+  </Card>
+</CardGroup>

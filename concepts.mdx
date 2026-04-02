@@ -1,0 +1,582 @@
+---
+title: "Concepts"
+description: "A detailed reference for every core concept in Open Multi-Agent: agents, teams, task DAGs, the coordinator pattern, shared memory, AgentPool concurrency, and progress events."
+---
+
+This page explains how the framework works from the inside out. Read it before diving into the API reference or writing complex pipelines.
+
+<CardGroup cols={2}>
+  <Card title="Agents" icon="user" href="#agents">
+    Configuration fields, conversation loop, and tool dispatch.
+  </Card>
+  <Card title="Teams" icon="users" href="#teams">
+    Agent rosters, shared memory, and message bus.
+  </Card>
+  <Card title="Task DAG" icon="diagram-project" href="#task-dag">
+    Task structure, dependency resolution, and status lifecycle.
+  </Card>
+  <Card title="Coordinator pattern" icon="wand-magic-sparkles" href="#coordinator-pattern">
+    How `runTeam()` decomposes goals and synthesizes results.
+  </Card>
+  <Card title="Shared memory" icon="database" href="#shared-memory">
+    Key-value store and the `task:{id}:result` pattern.
+  </Card>
+  <Card title="Progress events" icon="bell" href="#progress-events">
+    All `OrchestratorEvent` types and when they fire.
+  </Card>
+</CardGroup>
+
+---
+
+## Agents
+
+An **agent** is a stateful conversation loop paired with a set of tools. It sends messages to an LLM, receives a response, dispatches any tool calls the model requests, appends the tool results to the conversation, and repeats — until the model stops requesting tools or `maxTurns` is reached.
+
+### AgentConfig
+
+Every agent is defined by an `AgentConfig` object:
+
+```typescript
+interface AgentConfig {
+  readonly name: string
+  readonly model: string
+  readonly provider?: 'anthropic' | 'copilot' | 'openai'
+  readonly baseURL?: string
+  readonly apiKey?: string
+  readonly systemPrompt?: string
+  readonly tools?: readonly string[]
+  readonly maxTurns?: number
+  readonly maxTokens?: number
+  readonly temperature?: number
+}
+```
+
+<AccordionGroup>
+  <Accordion title="name" defaultOpen={false}>
+    **Required.** A unique identifier for the agent within its team. Used as the key in `TeamRunResult.agentResults` and in progress event `agent` fields.
+
+    ```typescript
+    name: 'developer'
+    ```
+  </Accordion>
+  <Accordion title="model">
+    **Required.** The model identifier string passed to the LLM provider. Must be a valid model name for the selected provider.
+
+    ```typescript
+    model: 'claude-sonnet-4-6'     // Anthropic
+    model: 'gpt-4o'                // OpenAI
+    model: 'llama3.2'              // Ollama (local)
+    ```
+  </Accordion>
+  <Accordion title="provider">
+    Which LLM backend to use. Defaults to the orchestrator's `defaultProvider` (which itself defaults to `'anthropic'`).
+
+    ```typescript
+    provider: 'anthropic'   // Claude models
+    provider: 'openai'      // GPT models or any OpenAI-compatible API
+    provider: 'copilot'     // GitHub Copilot
+    ```
+  </Accordion>
+  <Accordion title="baseURL">
+    Override the provider's API endpoint. Use this to point an agent at a local model server (Ollama, vLLM, LM Studio) or any OpenAI-compatible API.
+
+    ```typescript
+    provider: 'openai',
+    baseURL: 'http://localhost:11434/v1',  // Ollama
+    apiKey: 'ollama',                      // required placeholder — OpenAI SDK validates it
+    model: 'llama3.2',
+    ```
+
+    <Warning>
+      Local servers that don't require authentication still need `apiKey` set to a non-empty placeholder string. The OpenAI SDK validates the field even if the server ignores it.
+    </Warning>
+  </Accordion>
+  <Accordion title="apiKey">
+    Override the API key for this specific agent. Falls back to the orchestrator's `defaultApiKey`, then to the provider's standard environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`).
+  </Accordion>
+  <Accordion title="systemPrompt">
+    The system prompt that defines the agent's role and constraints. This text is sent to the LLM as the system message on every API call. Keep it focused — the agent performs better when its role is narrow and explicit.
+
+    ```typescript
+    systemPrompt: `You are a senior code reviewer. Review code for correctness, security, and clarity.
+Provide a structured review with: LGTM items, suggestions, and any blocking issues.
+Read files using the tools before reviewing.`
+    ```
+  </Accordion>
+  <Accordion title="tools">
+    An array of built-in tool names the agent is allowed to use. Only tools listed here are registered for the agent. Omit the field (or pass an empty array) to give the agent no tools.
+
+    ```typescript
+    tools: ['bash', 'file_read', 'file_write', 'file_edit', 'grep']
+    ```
+
+    Available built-in tools: `bash`, `file_read`, `file_write`, `file_edit`, `grep`. See the [built-in tools guide](/guides/built-in-tools) for details.
+  </Accordion>
+  <Accordion title="maxTurns">
+    Maximum number of LLM turns (round-trips) before the agent stops. Each turn is one LLM call plus any tool dispatches. Defaults to no limit if unset.
+
+    ```typescript
+    maxTurns: 5    // conservative — design/review agents
+    maxTurns: 12   // higher — implementation agents that write many files
+    ```
+  </Accordion>
+  <Accordion title="maxTokens">
+    Maximum tokens to generate per LLM response. Passed directly to the provider. If unset, the provider's default applies.
+  </Accordion>
+  <Accordion title="temperature">
+    Sampling temperature. Lower values produce more deterministic output; higher values produce more creative output.
+
+    ```typescript
+    temperature: 0.1   // deterministic — code generation
+    temperature: 0.3   // balanced — review and analysis
+    temperature: 0.7   // creative — writing tasks
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### What an agent does at runtime
+
+When you call `agent.run(prompt)` (or `orchestrator.runAgent(config, prompt)`), the agent:
+
+1. Appends your prompt as a `user` message.
+2. Calls the LLM with the conversation history, system prompt, and available tool schemas.
+3. If the LLM response contains `tool_use` blocks, dispatches each tool via `ToolExecutor` and appends the results as `tool_result` blocks.
+4. Repeats from step 2 until no more tool calls are present or `maxTurns` is exhausted.
+5. Returns `AgentRunResult` with the final text output, full message history, token usage, and a log of every tool call.
+
+```typescript
+interface AgentRunResult {
+  readonly success: boolean
+  readonly output: string
+  readonly messages: LLMMessage[]
+  readonly tokenUsage: TokenUsage
+  readonly toolCalls: ToolCallRecord[]
+}
+```
+
+---
+
+## Teams
+
+A **team** groups agents together and provides three shared services: a `MessageBus` for inter-agent messaging, a `TaskQueue` for work distribution, and an optional `SharedMemory` store.
+
+### TeamConfig
+
+```typescript
+interface TeamConfig {
+  readonly name: string
+  readonly agents: readonly AgentConfig[]
+  readonly sharedMemory?: boolean
+  readonly maxConcurrency?: number
+}
+```
+
+<AccordionGroup>
+  <Accordion title="name">
+    A unique identifier for the team. Used as the key in the orchestrator's internal registry and exposed in progress events.
+
+    ```typescript
+    name: 'api-team'
+    ```
+  </Accordion>
+  <Accordion title="agents">
+    The ordered list of agent configurations that belong to this team. The coordinator (created automatically by `runTeam()`) is not listed here — it is ephemeral.
+
+    ```typescript
+    agents: [architect, developer, reviewer]
+    ```
+  </Accordion>
+  <Accordion title="sharedMemory">
+    When `true`, the team allocates an `InMemoryStore` that all agents can read from and write to via `SharedMemory`. Each completed task automatically writes its output to `task:{taskId}:result`. Subsequent agents receive this context in their prompts.
+
+    ```typescript
+    sharedMemory: true
+    ```
+  </Accordion>
+  <Accordion title="maxConcurrency">
+    Maximum number of agents that can run simultaneously within this team. Defaults to the orchestrator's `maxConcurrency` (which defaults to `5`). Set to `1` when you want strictly sequential execution for easier log reading.
+
+    ```typescript
+    maxConcurrency: 1   // sequential
+    maxConcurrency: 3   // limited parallelism
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### What a team provides
+
+- **Agent roster** — `team.getAgents()` returns the `AgentConfig[]` used by the scheduler to assign tasks and by the pool to instantiate agents.
+- **Message bus** — Agents can send messages to specific teammates. Messages are injected into the receiving agent's next task prompt.
+- **Shared memory** — When `sharedMemory: true`, `team.getSharedMemoryInstance()` returns a live `SharedMemory` object. The orchestrator writes task results here and reads a summary into each agent's prompt.
+
+---
+
+## Task DAG
+
+A **task** is the unit of work the orchestrator schedules. Tasks form a directed acyclic graph (DAG) via the `dependsOn` field.
+
+### Task type
+
+```typescript
+interface Task {
+  readonly id: string
+  readonly title: string
+  readonly description: string
+  status: TaskStatus
+  assignee?: string
+  dependsOn?: readonly string[]
+  result?: string
+  readonly createdAt: Date
+  updatedAt: Date
+}
+
+type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked'
+```
+
+<AccordionGroup>
+  <Accordion title="id">
+    A stable UUID generated at task creation time. Used as the key for `dependsOn` references and shared memory writes (`task:{id}:result`).
+  </Accordion>
+  <Accordion title="title">
+    A short human-readable name. When the coordinator generates tasks, `dependsOn` references are initially title strings — the framework resolves them to IDs before scheduling begins.
+  </Accordion>
+  <Accordion title="description">
+    The full task description sent to the assigned agent as its prompt. Should include enough context for the agent to complete the work without asking follow-up questions.
+  </Accordion>
+  <Accordion title="status">
+    The current lifecycle state. Transitions are one-directional (see below).
+  </Accordion>
+  <Accordion title="assignee">
+    The `name` of the agent responsible for this task. The scheduler populates this if the coordinator omits it.
+  </Accordion>
+  <Accordion title="dependsOn">
+    IDs of tasks that must reach `completed` before this task can become `pending`. If any dependency fails, this task transitions to `blocked`.
+  </Accordion>
+  <Accordion title="result">
+    The final output string written when the task completes (or the error message when it fails). Also persisted to shared memory.
+  </Accordion>
+</AccordionGroup>
+
+### Task status lifecycle
+
+```
+                  ┌─────────┐
+                  │ pending │  ← initial state (all deps satisfied)
+                  └────┬────┘
+                       │ dispatcher picks it up
+                  ┌────▼────────┐
+                  │ in_progress │
+                  └────┬────────┘
+              ┌────────┴────────┐
+         success             failure
+              │                  │
+       ┌──────▼──────┐   ┌───────▼──────┐
+       │  completed  │   │    failed    │
+       └─────────────┘   └──────────────┘
+                                │
+                    dependents transition to:
+                         ┌──────▼──────┐
+                         │   blocked   │
+                         └─────────────┘
+```
+
+<Warning>
+  A `blocked` task never becomes `pending` again. If a dependency fails, the blocked task stays blocked for the rest of the run. Non-blocked tasks continue executing normally.
+</Warning>
+
+### Dependency resolution
+
+When tasks are loaded (either from the coordinator's JSON output or from `runTasks()`), the framework performs a **two-pass resolution**:
+
+1. **First pass** — Create all tasks without dependencies to get stable IDs. Build a `title → id` map.
+2. **Second pass** — For each task's `dependsOn` array, look up each entry first by raw ID, then by lowercase-trimmed title string. Replace title references with the resolved IDs before adding tasks to the queue.
+
+This means the coordinator can output `"dependsOn": ["Design API"]` and the framework will correctly resolve `"Design API"` to the ID of the task titled `"Design API"`.
+
+The `TaskQueue` then uses topological ordering to surface only tasks whose dependencies are all `completed` as `pending`.
+
+---
+
+## Coordinator pattern
+
+The coordinator pattern is `runTeam()`'s core mechanism. It uses a temporary LLM-powered agent to translate a plain-text goal into a typed task DAG, and then to synthesize a final answer when all tasks complete.
+
+### How runTeam() works internally
+
+<Steps>
+  <Step title="Coordinator decomposes the goal">
+    A temporary `coordinator` agent is created with the system prompt that lists the team roster. It receives a decomposition prompt:
+
+    ```
+    Decompose the following goal into tasks for your team (architect, developer, reviewer).
+
+    ## Goal
+    Create a minimal Express.js REST API in /tmp/express-api/ with: ...
+
+    Return ONLY the JSON task array in a ```json code fence.
+    ```
+
+    The coordinator responds with a JSON array:
+
+    ```json
+    [
+      {
+        "title": "Design API structure",
+        "description": "Define the Express routes, middleware, and file layout...",
+        "assignee": "architect",
+        "dependsOn": []
+      },
+      {
+        "title": "Implement the API",
+        "description": "Write all routes and middleware as specified by the architect...",
+        "assignee": "developer",
+        "dependsOn": ["Design API structure"]
+      },
+      {
+        "title": "Review the implementation",
+        "description": "Read all source files and provide a structured code review...",
+        "assignee": "reviewer",
+        "dependsOn": ["Implement the API"]
+      }
+    ]
+    ```
+  </Step>
+  <Step title="Tasks are loaded into the queue">
+    `dependsOn` title strings are resolved to task IDs. Tasks are added to the `TaskQueue`.
+  </Step>
+  <Step title="Scheduler auto-assigns unassigned tasks">
+    Any tasks the coordinator left without an `assignee` are assigned to the most available agent by the `Scheduler`.
+  </Step>
+  <Step title="Tasks execute in dependency order">
+    The `AgentPool` dispatches all currently-`pending` tasks as a parallel batch. When a task completes, its result is written to shared memory and the queue unblocks any dependents. The loop repeats until no `pending` tasks remain.
+  </Step>
+  <Step title="Coordinator synthesizes the final answer">
+    The coordinator agent receives a synthesis prompt containing all completed task outputs and any shared memory context. It writes a comprehensive final answer.
+
+    This synthesis result is stored in `result.agentResults.get('coordinator')`.
+  </Step>
+</Steps>
+
+### Fallback when decomposition fails
+
+If the coordinator's output cannot be parsed as a JSON task array, the framework falls back to one task per agent: each agent receives the original goal as its entire task description. This is intentionally degraded — prefer prompts that produce clean JSON output.
+
+---
+
+## Shared memory
+
+**Shared memory** is a key-value store that persists between task executions within a single team run. It lets later agents read the output of earlier ones.
+
+### MemoryStore interface
+
+```typescript
+interface MemoryStore {
+  get(key: string): Promise<MemoryEntry | null>
+  set(key: string, value: string, metadata?: Record<string, unknown>): Promise<void>
+  list(): Promise<MemoryEntry[]>
+  delete(key: string): Promise<void>
+  clear(): Promise<void>
+}
+
+interface MemoryEntry {
+  readonly key: string
+  readonly value: string
+  readonly metadata?: Readonly<Record<string, unknown>>
+  readonly createdAt: Date
+}
+```
+
+The default implementation (`InMemoryStore`) is a plain in-memory Map. For production use cases requiring persistence, you can implement `MemoryStore` backed by Redis, SQLite, or any other store.
+
+### The task result key pattern
+
+After each task completes, the orchestrator writes:
+
+```typescript
+await sharedMemory.write(assignee, `task:${task.id}:result`, result.output)
+```
+
+When subsequent agents run, their prompt includes a summary of everything in shared memory. This means an agent can read the architect's design even if it wasn't explicitly listed as a dependency.
+
+<Tip>
+  Enable shared memory with `sharedMemory: true` in `TeamConfig`. When disabled, agents have no access to each other's outputs unless you explicitly pass them in task descriptions.
+</Tip>
+
+---
+
+## AgentPool and concurrency
+
+The **AgentPool** holds one `Agent` instance per team member and controls how many can run simultaneously via a `Semaphore`.
+
+### How the semaphore works
+
+```typescript
+// AgentPool is created with a concurrency limit:
+const pool = new AgentPool(maxConcurrency)  // default: 5
+
+// pool.run() acquires a semaphore slot before running the agent,
+// and releases it when the agent completes (success or failure).
+const result = await pool.run('developer', taskPrompt)
+```
+
+When `maxConcurrency` slots are all occupied, `pool.run()` waits until a slot is released. This prevents unbounded parallel LLM calls and makes token usage predictable.
+
+### Setting maxConcurrency
+
+`maxConcurrency` can be set at two levels:
+
+```typescript
+// Orchestrator level — applies to all runs
+const orchestrator = new OpenMultiAgent({
+  maxConcurrency: 3,
+})
+
+// Team level — overrides for this team
+const team = orchestrator.createTeam('api-team', {
+  name: 'api-team',
+  agents: [...],
+  maxConcurrency: 1,   // sequential for readable logs
+})
+```
+
+The default is `5`. Set it to `1` during development to make progress output easier to follow. Set it higher for fan-out patterns where many agents can work in parallel.
+
+---
+
+## Progress events
+
+The `onProgress` callback in `OrchestratorConfig` receives `OrchestratorEvent` objects as the run progresses. Subscribe to it for logging, dashboards, or real-time UI updates.
+
+### OrchestratorEvent type
+
+```typescript
+interface OrchestratorEvent {
+  readonly type:
+    | 'agent_start'
+    | 'agent_complete'
+    | 'task_start'
+    | 'task_complete'
+    | 'message'
+    | 'error'
+  readonly agent?: string
+  readonly task?: string
+  readonly data?: unknown
+}
+```
+
+### Event types
+
+<Tabs>
+  <Tab title="agent_start">
+    Fires when an agent begins executing. `agent` is the agent name. `data` contains context about what the agent is about to do.
+
+    ```typescript
+    // From runAgent():
+    { type: 'agent_start', agent: 'coder', data: { prompt } }
+
+    // From runTeam() coordinator decomposition:
+    { type: 'agent_start', agent: 'coordinator', data: { phase: 'decomposition', goal } }
+
+    // From runTeam() task execution:
+    { type: 'agent_start', agent: 'developer', task: 'task-abc123', data: task }
+    ```
+  </Tab>
+  <Tab title="agent_complete">
+    Fires when an agent finishes. `data` is the `AgentRunResult`.
+
+    ```typescript
+    { type: 'agent_complete', agent: 'developer', task: 'task-abc123', data: result }
+    ```
+  </Tab>
+  <Tab title="task_start">
+    Fires when a task transitions from `pending` to `in_progress`. `task` is the task ID.
+
+    ```typescript
+    { type: 'task_start', task: 'task-abc123', agent: 'developer', data: task }
+    ```
+  </Tab>
+  <Tab title="task_complete">
+    Fires when a task transitions to `completed`. `data` is the `AgentRunResult` that produced the completion.
+
+    ```typescript
+    { type: 'task_complete', task: 'task-abc123', agent: 'developer', data: result }
+    ```
+  </Tab>
+  <Tab title="message">
+    Fires when an agent sends a message to the team bus.
+
+    ```typescript
+    { type: 'message', agent: 'architect', data: message }
+    ```
+  </Tab>
+  <Tab title="error">
+    Fires when a task fails or an agent throws. `data` may be an `Error` or a string message. The run continues for non-dependent tasks.
+
+    ```typescript
+    { type: 'error', task: 'task-abc123', agent: 'developer', data: error }
+    ```
+  </Tab>
+</Tabs>
+
+### Example progress handler
+
+This is the handler from `examples/02-team-collaboration.ts`:
+
+```typescript
+const startTimes = new Map<string, number>()
+
+function handleProgress(event: OrchestratorEvent): void {
+  const ts = new Date().toISOString().slice(11, 23) // HH:MM:SS.mmm
+
+  switch (event.type) {
+    case 'agent_start':
+      startTimes.set(event.agent ?? '', Date.now())
+      console.log(`[${ts}] AGENT START  → ${event.agent}`)
+      break
+
+    case 'agent_complete': {
+      const elapsed = Date.now() - (startTimes.get(event.agent ?? '') ?? Date.now())
+      console.log(`[${ts}] AGENT DONE   ← ${event.agent} (${elapsed}ms)`)
+      break
+    }
+
+    case 'task_start':
+      console.log(`[${ts}] TASK START   ↓ ${event.task}`)
+      break
+
+    case 'task_complete':
+      console.log(`[${ts}] TASK DONE    ↑ ${event.task}`)
+      break
+
+    case 'message':
+      console.log(`[${ts}] MESSAGE      • ${event.agent} → (team)`)
+      break
+
+    case 'error':
+      console.error(`[${ts}] ERROR        ✗ agent=${event.agent} task=${event.task}`)
+      if (event.data instanceof Error) {
+        console.error(`               ${event.data.message}`)
+      }
+      break
+  }
+}
+```
+
+---
+
+## Further reading
+
+<CardGroup cols={2}>
+  <Card title="Team orchestration guide" icon="users" href="/guides/team-orchestration">
+    End-to-end walkthrough of `runTeam()` with a real multi-agent example.
+  </Card>
+  <Card title="Task pipeline guide" icon="diagram-project" href="/guides/task-pipeline">
+    Define explicit task graphs with `runTasks()` — no coordinator involved.
+  </Card>
+  <Card title="API: types" icon="code" href="/api/types">
+    Complete type signatures for every interface in the framework.
+  </Card>
+  <Card title="API: orchestrator" icon="code" href="/api/orchestrator">
+    Full reference for `OpenMultiAgent` methods and configuration.
+  </Card>
+</CardGroup>

@@ -1,0 +1,262 @@
+---
+title: "Fan-Out / Aggregate"
+description: "Send the same prompt to N agents in parallel with AgentPool.runParallel(), then feed all outputs to a synthesizer agent."
+---
+
+The fan-out / aggregate pattern (also known as MapReduce for LLM workflows) runs multiple agents concurrently on the same input, then passes all their outputs to a single aggregator agent that synthesises a final result.
+
+<CardGroup cols={2}>
+  <Card title="AgentPool" icon="server" href="/api/task-queue">
+    Manages a named set of agents and exposes `runParallel()` for concurrent dispatch and `run()` for single-agent calls.
+  </Card>
+  <Card title="No coordinator overhead" icon="bolt" href="/api/orchestrator">
+    Unlike `runTeam()`, there is no coordinator agent. You control the two stages explicitly in your own code.
+  </Card>
+</CardGroup>
+
+## When to use fan-out / aggregate
+
+<Tabs>
+  <Tab title="Use fan-out / aggregate when...">
+    - You want N agents to independently analyse the same input (different perspectives, personas, or expertise areas)
+    - You need responses from all agents before deciding what to do next
+    - The aggregation logic is simple enough to express in a single synthesizer prompt
+    - You want the lowest possible wall-clock latency — all analysts run simultaneously
+  </Tab>
+  <Tab title="Use runTeam() instead when...">
+    - The subtasks are different from each other, not repetitions of the same prompt
+    - Agents need to hand off results sequentially (architect → developer → reviewer)
+    - You want the coordinator to decide which agent does what
+    - See [Team Orchestration](/guides/team-orchestration) for details
+  </Tab>
+  <Tab title="Use runTasks() instead when...">
+    - You have an explicit dependency graph where some tasks must complete before others start
+    - See [Task Pipeline](/guides/task-pipeline) for details
+  </Tab>
+</Tabs>
+
+## Defining analyst agents
+
+Each analyst gets a distinct persona via `systemPrompt`. All other config is identical — same model, same topic, same `maxTurns: 1` (one-shot analysis):
+
+```typescript
+import { Agent, AgentPool, ToolRegistry, ToolExecutor, registerBuiltInTools } from '@jackchen_me/open-multi-agent'
+import type { AgentConfig, AgentRunResult } from 'open-multi-agent/types'
+
+const TOPIC = `Should a solo developer build a SaaS product that uses AI agents
+for automated customer support? Consider the current state of AI technology,
+market demand, competition, costs, and the unique constraints of being a solo
+founder with limited time (~6 hours/day of productive work).`
+
+const optimistConfig: AgentConfig = {
+  name: 'optimist',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: `You are an optimistic technology analyst who focuses on
+opportunities, upside potential, and emerging trends. You see possibilities
+where others see obstacles. Back your optimism with concrete reasoning —
+cite market trends, cost curves, and real capabilities. Keep your analysis
+to 200-300 words.`,
+  maxTurns: 1,
+  temperature: 0.4,
+}
+
+const skepticConfig: AgentConfig = {
+  name: 'skeptic',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: `You are a skeptical technology analyst who focuses on risks,
+challenges, failure modes, and hidden costs. You stress-test assumptions and
+ask "what could go wrong?" Back your skepticism with concrete reasoning —
+cite failure rates, technical limitations, and market realities. Keep your
+analysis to 200-300 words.`,
+  maxTurns: 1,
+  temperature: 0.4,
+}
+
+const pragmatistConfig: AgentConfig = {
+  name: 'pragmatist',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: `You are a pragmatic technology analyst who focuses on practical
+feasibility, execution complexity, and resource requirements. You care about
+what works today, not what might work someday. You think in terms of MVPs,
+timelines, and concrete tradeoffs. Keep your analysis to 200-300 words.`,
+  maxTurns: 1,
+  temperature: 0.4,
+}
+```
+
+## Defining the synthesizer agent
+
+The synthesizer receives all analyst outputs and produces a structured final recommendation:
+
+```typescript
+const synthesizerConfig: AgentConfig = {
+  name: 'synthesizer',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: `You are a senior strategy advisor who synthesizes multiple
+perspectives into a balanced, actionable recommendation. You do not simply
+summarise — you weigh the arguments, identify where they agree and disagree,
+and produce a clear verdict with next steps. Structure your output as:
+
+1. Key agreements across perspectives
+2. Key disagreements and how you weigh them
+3. Verdict (go / no-go / conditional go)
+4. Recommended next steps (3-5 bullet points)
+
+Keep the final report to 300-400 words.`,
+  maxTurns: 1,
+  temperature: 0.3,
+}
+```
+
+## Building the pool
+
+`AgentPool` holds a named collection of `Agent` instances. Create each agent by injecting a `ToolRegistry` and `ToolExecutor`, then add them to the pool:
+
+```typescript
+function buildAgent(config: AgentConfig): Agent {
+  const registry = new ToolRegistry()
+  registerBuiltInTools(registry) // safe even if the agent uses no tools
+  const executor = new ToolExecutor(registry)
+  return new Agent(config, registry, executor)
+}
+
+const optimist   = buildAgent(optimistConfig)
+const skeptic    = buildAgent(skepticConfig)
+const pragmatist = buildAgent(pragmatistConfig)
+const synthesizer = buildAgent(synthesizerConfig)
+
+const pool = new AgentPool(3) // 3 analysts can run simultaneously
+pool.add(optimist)
+pool.add(skeptic)
+pool.add(pragmatist)
+pool.add(synthesizer)
+```
+
+<Note>
+  The number passed to `new AgentPool(n)` is the pool's concurrency limit. Setting it to 3 means up to three agents can run simultaneously. The synthesizer is added to the same pool but is called sequentially after the fan-out completes.
+</Note>
+
+## Step 1: Fan-out with `runParallel()`
+
+`pool.runParallel()` accepts an array of `{ agent, prompt }` pairs and returns a `Map<string, AgentRunResult>` keyed by agent name. All three calls are dispatched concurrently:
+
+```typescript
+console.log('[Step 1] Fan-out: 3 analysts running in parallel...\n')
+
+const analystResults: Map<string, AgentRunResult> = await pool.runParallel([
+  { agent: 'optimist',   prompt: TOPIC },
+  { agent: 'skeptic',    prompt: TOPIC },
+  { agent: 'pragmatist', prompt: TOPIC },
+])
+
+// Inspect each analyst's output
+const analysts = ['optimist', 'skeptic', 'pragmatist'] as const
+for (const name of analysts) {
+  const result = analystResults.get(name)!
+  const status = result.success ? 'OK' : 'FAILED'
+  console.log(`  ${name} [${status}] — ${result.tokenUsage.output_tokens} output tokens`)
+  console.log(`  ${result.output.slice(0, 150).replace(/\n/g, ' ')}...`)
+  console.log()
+}
+
+// Fail fast if any analyst failed
+for (const name of analysts) {
+  if (!analystResults.get(name)!.success) {
+    console.error(`Analyst '${name}' failed: ${analystResults.get(name)!.output}`)
+    process.exit(1)
+  }
+}
+```
+
+## Step 2: Aggregate with `pool.run()`
+
+Build a synthesis prompt that inlines all analyst outputs, then call a single named agent:
+
+```typescript
+console.log('[Step 2] Aggregate: synthesizer producing final report...\n')
+
+const synthesizerPrompt = `Three analysts have independently evaluated the same question.
+Read their analyses below and produce your synthesis report.
+
+--- OPTIMIST ---
+${analystResults.get('optimist')!.output}
+
+--- SKEPTIC ---
+${analystResults.get('skeptic')!.output}
+
+--- PRAGMATIST ---
+${analystResults.get('pragmatist')!.output}
+
+Now synthesize these three perspectives into a balanced recommendation.`
+
+const synthResult = await pool.run('synthesizer', synthesizerPrompt)
+
+if (!synthResult.success) {
+  console.error('Synthesizer failed:', synthResult.output)
+  process.exit(1)
+}
+
+console.log(synthResult.output)
+```
+
+## Token usage across the pipeline
+
+Because all analysts run in parallel, wall-clock time is roughly equal to the slowest analyst — not the sum of all three. Token costs are still additive:
+
+```typescript
+let totalInput = 0
+let totalOutput = 0
+
+for (const name of analysts) {
+  const r = analystResults.get(name)!
+  totalInput  += r.tokenUsage.input_tokens
+  totalOutput += r.tokenUsage.output_tokens
+  console.log(
+    `  ${name.padEnd(12)} — input: ${r.tokenUsage.input_tokens}, output: ${r.tokenUsage.output_tokens}`,
+  )
+}
+
+totalInput  += synthResult.tokenUsage.input_tokens
+totalOutput += synthResult.tokenUsage.output_tokens
+console.log(
+  `  ${'synthesizer'.padEnd(12)} — input: ${synthResult.tokenUsage.input_tokens}, output: ${synthResult.tokenUsage.output_tokens}`,
+)
+console.log('─'.repeat(60))
+console.log(`  ${'TOTAL'.padEnd(12)} — input: ${totalInput}, output: ${totalOutput}`)
+```
+
+<Tip>
+  The synthesizer's `input_tokens` will be high because it receives all three analyst outputs concatenated. If token costs are a concern, summarise each analyst output before passing it to the synthesizer.
+</Tip>
+
+## `AgentPool` API summary
+
+| Method                                         | Returns                         | Description                                                      |
+| ---------------------------------------------- | ------------------------------- | ---------------------------------------------------------------- |
+| `new AgentPool(concurrency)`                   | `AgentPool`                     | Creates a pool with the given max concurrency.                   |
+| `pool.add(agent)`                              | `void`                          | Registers an `Agent` instance by its `config.name`.              |
+| `pool.run(name, prompt)`                       | `Promise<AgentRunResult>`       | Runs a single named agent with the given prompt.                 |
+| `pool.runParallel([{ agent, prompt }, ...])`   | `Promise<Map<string, AgentRunResult>>` | Dispatches multiple agents concurrently; returns all results when every agent finishes. |
+
+## Running the full example
+
+```bash
+ANTHROPIC_API_KEY=your_key npx tsx examples/07-fan-out-aggregate.ts
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Team Orchestration" icon="users" href="/guides/team-orchestration">
+    Let the orchestrator decompose a goal across agents automatically.
+  </Card>
+  <Card title="Task Pipeline" icon="list-checks" href="/guides/task-pipeline">
+    Build explicit task graphs with `dependsOn` dependency chains.
+  </Card>
+  <Card title="API: Types" icon="file-code" href="/api/types">
+    AgentRunResult, AgentConfig, TokenUsage, and all other core types.
+  </Card>
+  <Card title="API: Agent" icon="code" href="/api/agent">
+    Full Agent class reference including prompt(), run(), and stream().
+  </Card>
+</CardGroup>

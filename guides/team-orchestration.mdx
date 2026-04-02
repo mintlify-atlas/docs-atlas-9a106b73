@@ -1,0 +1,289 @@
+---
+title: "Team Orchestration"
+description: "Coordinate multiple specialised agents on a shared goal using createTeam() and runTeam() with auto-decomposition."
+---
+
+`runTeam()` hands a plain-English goal to a roster of specialised agents and lets the orchestrator handle decomposition, assignment, parallel execution, and result collection. No manual task graph needed.
+
+<CardGroup cols={2}>
+  <Card title="Auto-decomposition" icon="diagram-project" href="/api/orchestrator">
+    A coordinator agent breaks the goal into tasks and routes each one to the right agent based on their system prompts.
+  </Card>
+  <Card title="Shared memory" icon="database" href="/api/memory">
+    With `sharedMemory: true`, each agent's output is available to the agents that run after it.
+  </Card>
+</CardGroup>
+
+## Defining agent roles
+
+Each agent in a team has a focused `systemPrompt` and only the tools it needs:
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+import type { AgentConfig, OrchestratorEvent } from 'open-multi-agent/types'
+
+const architect: AgentConfig = {
+  name: 'architect',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: `You are a software architect with deep experience in Node.js and REST API design.
+Your job is to design clear, production-quality API contracts and file/directory structures.
+Output concise plans in markdown — no unnecessary prose.`,
+  tools: ['bash', 'file_write'],
+  maxTurns: 5,
+  temperature: 0.2,
+}
+
+const developer: AgentConfig = {
+  name: 'developer',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: `You are a TypeScript/Node.js developer. You implement what the architect specifies.
+Write clean, runnable code with proper error handling. Use the tools to write files and run tests.`,
+  tools: ['bash', 'file_read', 'file_write', 'file_edit'],
+  maxTurns: 12,
+  temperature: 0.1,
+}
+
+const reviewer: AgentConfig = {
+  name: 'reviewer',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: `You are a senior code reviewer. Review code for correctness, security, and clarity.
+Provide a structured review with: LGTM items, suggestions, and any blocking issues.
+Read files using the tools before reviewing.`,
+  tools: ['bash', 'file_read', 'grep'],
+  maxTurns: 5,
+  temperature: 0.3,
+}
+```
+
+<Tip>
+  Write system prompts that describe **what the agent produces**, not just what it is. The coordinator reads these descriptions to decide task assignment. "Output concise plans in markdown" is more useful than "You are an architect."
+</Tip>
+
+## Creating the team
+
+`createTeam()` registers the agents and returns a `Team` instance. Pass a team ID and a `TeamConfig`:
+
+```typescript
+const orchestrator = new OpenMultiAgent({
+  defaultModel: 'claude-sonnet-4-6',
+  maxConcurrency: 1, // run agents sequentially so output is readable
+  onProgress: handleProgress,
+})
+
+const team = orchestrator.createTeam('api-team', {
+  name: 'api-team',
+  agents: [architect, developer, reviewer],
+  sharedMemory: true,
+  maxConcurrency: 1,
+})
+
+console.log(`Team "${team.name}" created with agents: ${team.getAgents().map(a => a.name).join(', ')}`)
+```
+
+### `TeamConfig` fields
+
+| Field            | Type            | Default | Description                                                                                  |
+| ---------------- | --------------- | ------- | -------------------------------------------------------------------------------------------- |
+| `name`           | `string`        | —       | Unique team identifier shown in progress events.                                             |
+| `agents`         | `AgentConfig[]` | —       | Ordered list of agent definitions.                                                           |
+| `sharedMemory`   | `boolean`       | `false` | When `true`, each agent's output is written to a shared `MemoryStore` visible to later agents.|
+| `maxConcurrency` | `number`        | `3`     | Maximum agents running simultaneously within this team.                                       |
+
+<Warning>
+  Enable `sharedMemory: true` whenever agents need to build on each other's work (e.g. a developer reading an architect's spec). Without it, agents are isolated and cannot see each other's outputs.
+</Warning>
+
+## Running the team
+
+Pass the `Team` instance and a natural-language goal to `runTeam()`:
+
+```typescript
+const goal = `Create a minimal Express.js REST API in /tmp/express-api/ with:
+- GET  /health       → { status: "ok" }
+- GET  /users        → returns a hardcoded array of 2 user objects
+- POST /users        → accepts { name, email } body, logs it, returns 201
+- Proper error handling middleware
+- The server should listen on port 3001
+- Include a package.json with the required dependencies`
+
+const result = await orchestrator.runTeam(team, goal)
+```
+
+## How auto-decomposition works
+
+<Steps>
+  <Step title="Coordinator decomposes the goal">
+    A temporary coordinator agent receives the goal and the team roster. It responds with a JSON array of task objects — each with a `title`, `description`, `assignee`, and `dependsOn` array.
+  </Step>
+  <Step title="Tasks loaded into the queue">
+    The framework parses the coordinator output and loads tasks into a `TaskQueue`. Title-based `dependsOn` references are resolved to internal task IDs.
+  </Step>
+  <Step title="Parallel execution with dependency ordering">
+    The orchestration loop picks all `pending` tasks whose dependencies are satisfied, dispatches them as a parallel batch via `AgentPool`, and waits before checking for newly unblocked tasks. Up to `maxConcurrency` agents run simultaneously.
+  </Step>
+  <Step title="Results written to shared memory">
+    After each task completes, the agent's output is persisted to the shared memory store. Subsequent agents automatically receive this context in their task prompts.
+  </Step>
+  <Step title="Coordinator synthesises the final answer">
+    Once all tasks finish, the coordinator produces a single, comprehensive final answer from the collected outputs.
+  </Step>
+</Steps>
+
+## Tracking progress with `onProgress`
+
+The `onProgress` callback receives structured `OrchestratorEvent` objects throughout the run:
+
+```typescript
+const startTimes = new Map<string, number>()
+
+function handleProgress(event: OrchestratorEvent): void {
+  const ts = new Date().toISOString().slice(11, 23) // HH:MM:SS.mmm
+
+  switch (event.type) {
+    case 'agent_start':
+      startTimes.set(event.agent ?? '', Date.now())
+      console.log(`[${ts}] AGENT START  → ${event.agent}`)
+      break
+
+    case 'agent_complete': {
+      const elapsed = Date.now() - (startTimes.get(event.agent ?? '') ?? Date.now())
+      console.log(`[${ts}] AGENT DONE   ← ${event.agent} (${elapsed}ms)`)
+      break
+    }
+
+    case 'task_start':
+      console.log(`[${ts}] TASK START   ↓ ${event.task}`)
+      break
+
+    case 'task_complete':
+      console.log(`[${ts}] TASK DONE    ↑ ${event.task}`)
+      break
+
+    case 'message':
+      console.log(`[${ts}] MESSAGE      • ${event.agent} → (team)`)
+      break
+
+    case 'error':
+      console.error(`[${ts}] ERROR        ✗ agent=${event.agent} task=${event.task}`)
+      if (event.data instanceof Error) {
+        console.error(`               ${event.data.message}`)
+      }
+      break
+  }
+}
+```
+
+### `OrchestratorEvent` fields
+
+| Field   | Type      | Description                                                                             |
+| ------- | --------- | --------------------------------------------------------------------------------------- |
+| `type`  | `string`  | One of `agent_start`, `agent_complete`, `task_start`, `task_complete`, `message`, `error`. |
+| `agent` | `string?` | Name of the agent involved, when applicable.                                            |
+| `task`  | `string?` | Task ID, when applicable.                                                               |
+| `data`  | `unknown` | Type-specific payload: a `Task` object for task events, an `Error` for error events.   |
+
+## Reading `TeamRunResult`
+
+`runTeam()` returns a `TeamRunResult` with per-agent results in a `Map<string, AgentRunResult>` keyed by agent name:
+
+```typescript
+console.log(`Success: ${result.success}`)
+console.log(
+  `Total tokens — input: ${result.totalTokenUsage.input_tokens}, output: ${result.totalTokenUsage.output_tokens}`,
+)
+
+// Iterate every agent
+for (const [agentName, agentResult] of result.agentResults) {
+  const status = agentResult.success ? 'OK' : 'FAILED'
+  const tools = agentResult.toolCalls.length
+  console.log(`  ${agentName.padEnd(12)} [${status}]  tool_calls=${tools}`)
+  if (!agentResult.success) {
+    console.log(`    Error: ${agentResult.output.slice(0, 120)}`)
+  }
+}
+
+// Access a specific agent's output directly
+const developerResult = result.agentResults.get('developer')
+if (developerResult?.success) {
+  const out = developerResult.output
+  console.log(out.length > 600 ? '...' + out.slice(-600) : out)
+}
+
+// The reviewer's findings
+const reviewerResult = result.agentResults.get('reviewer')
+if (reviewerResult?.success) {
+  console.log('\nReviewer output:')
+  console.log(reviewerResult.output)
+}
+```
+
+### `TeamRunResult` fields
+
+| Field             | Type                          | Description                                                   |
+| ----------------- | ----------------------------- | ------------------------------------------------------------- |
+| `success`         | `boolean`                     | `true` only when every agent completed without a fatal error. |
+| `agentResults`    | `Map<string, AgentRunResult>` | Per-agent results, keyed by `AgentConfig.name`.               |
+| `totalTokenUsage` | `TokenUsage`                  | Sum of `input_tokens` and `output_tokens` across all agents.  |
+
+Each value in `agentResults` is a full `AgentRunResult` — see [Single Agent](/guides/single-agent#agentrunresult-fields) for the field descriptions.
+
+<Note>
+  The `agentResults` map also includes a `'coordinator'` entry containing the synthesised final answer produced after all tasks complete.
+</Note>
+
+## Shared memory in depth
+
+When `sharedMemory: true` is set, all agents share a single `MemoryStore`. Each agent's output is automatically written after it completes, so subsequent agents receive that context in their task prompts.
+
+```typescript
+const team = orchestrator.createTeam('api-team', {
+  name: 'api-team',
+  agents: [architect, developer, reviewer],
+  sharedMemory: true, // architect's plan is visible to developer and reviewer
+})
+```
+
+The default store is an in-process key-value Map — ephemeral and not shared across restarts. For persistent cross-run memory, provide a custom `MemoryStore` implementation backed by Redis or SQLite. See the [Memory API](/api/memory).
+
+## When to use `runTeam()` vs alternatives
+
+<CardGroup cols={2}>
+  <Card title="Use runTeam()" icon="users">
+    When you know the agents but not the exact subtasks ahead of time, and want the coordinator to handle decomposition automatically.
+  </Card>
+  <Card title="Use runTasks()" icon="list-checks" href="/guides/task-pipeline">
+    When you need a deterministic task graph with explicit `dependsOn` chains and known assignees from the start.
+  </Card>
+  <Card title="Use Fan-Out / Aggregate" icon="git-fork" href="/guides/fan-out-aggregate">
+    When the same prompt must go to N agents in parallel and their outputs need to be merged.
+  </Card>
+  <Card title="Use runAgent()" icon="user" href="/guides/single-agent">
+    When the work fits in a single prompt to a single agent.
+  </Card>
+</CardGroup>
+
+## Running the full example
+
+```bash
+ANTHROPIC_API_KEY=your_key npx tsx examples/02-team-collaboration.ts
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Task Pipeline" icon="list-checks" href="/guides/task-pipeline">
+    Define an explicit dependency graph for deterministic pipelines.
+  </Card>
+  <Card title="Fan-Out / Aggregate" icon="git-fork" href="/guides/fan-out-aggregate">
+    Run the same prompt across N agents in parallel, then aggregate.
+  </Card>
+  <Card title="API: Orchestrator" icon="code" href="/api/orchestrator">
+    Full reference for OpenMultiAgent and OrchestratorConfig.
+  </Card>
+  <Card title="API: Memory" icon="database" href="/api/memory">
+    Implement a persistent MemoryStore for cross-run context.
+  </Card>
+</CardGroup>

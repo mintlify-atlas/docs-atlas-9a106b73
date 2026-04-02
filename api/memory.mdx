@@ -1,0 +1,312 @@
+---
+title: "Memory"
+description: "Key-value memory store interface, in-memory implementation, and namespaced shared memory for teams of cooperating agents."
+---
+
+## Overview
+
+The memory system has two layers:
+
+- **`MemoryStore`** — a minimal async key-value interface. Swap implementations to use Redis, SQLite, or any other backend.
+- **`SharedMemory`** — a namespaced wrapper over `InMemoryStore` for multi-agent teams. Each agent writes under its own prefix so entries remain attributable while any agent can read any entry.
+
+```typescript
+import { SharedMemory, InMemoryStore } from '@jackchen_me/open-multi-agent'
+
+// Standalone store
+const store = new InMemoryStore()
+await store.set('config', JSON.stringify({ model: 'claude-opus-4-6' }))
+const storeEntry = await store.get('config')
+
+// Shared team memory
+const mem = new SharedMemory()
+await mem.write('researcher', 'findings', 'TypeScript 5.5 ships const type params')
+await mem.write('coder', 'plan', 'Implement feature X using const type params')
+
+const entry = await mem.read('researcher/findings')
+const summary = await mem.getSummary()
+```
+
+---
+
+## `MemoryEntry`
+
+A single key-value record stored in a `MemoryStore`.
+
+```typescript
+interface MemoryEntry {
+  readonly key: string
+  readonly value: string
+  readonly metadata?: Readonly<Record<string, unknown>>
+  readonly createdAt: Date
+}
+```
+
+<ResponseField name="key" type="string" required>
+  Opaque string key. In `SharedMemory`, keys are namespaced as `<agentName>/<key>`.
+</ResponseField>
+
+<ResponseField name="value" type="string" required>
+  Stored value. Always a string — serialise structured data before writing (e.g. `JSON.stringify`).
+</ResponseField>
+
+<ResponseField name="metadata" type="Record<string, unknown>">
+  Optional arbitrary metadata stored alongside the entry. `SharedMemory` automatically adds `{ agent: agentName }` to all entries it writes.
+</ResponseField>
+
+<ResponseField name="createdAt" type="Date" required>
+  Timestamp set when the entry was first written. `InMemoryStore` preserves this on subsequent upserts so callers can detect when a value was first created.
+</ResponseField>
+
+---
+
+## `MemoryStore` interface
+
+Persistent (or in-memory) key-value store shared across agents. Implement this interface to use Redis, SQLite, or any other backend without changing agent or team code.
+
+```typescript
+interface MemoryStore {
+  get(key: string): Promise<MemoryEntry | null>
+  set(key: string, value: string, metadata?: Record<string, unknown>): Promise<void>
+  list(): Promise<MemoryEntry[]>
+  delete(key: string): Promise<void>
+  clear(): Promise<void>
+}
+```
+
+<ResponseField name="get" type="(key: string) => Promise<MemoryEntry | null>">
+  Returns the entry for `key`, or `null` if not present.
+</ResponseField>
+
+<ResponseField name="set" type="(key: string, value: string, metadata?) => Promise<void>">
+  Upserts `key` with `value` and optional `metadata`. Creates the entry if absent; updates the value and metadata if the key already exists.
+</ResponseField>
+
+<ResponseField name="list" type="() => Promise<MemoryEntry[]>">
+  Returns a snapshot of all entries.
+</ResponseField>
+
+<ResponseField name="delete" type="(key: string) => Promise<void>">
+  Removes the entry for `key`. Deleting a non-existent key is a no-op.
+</ResponseField>
+
+<ResponseField name="clear" type="() => Promise<void>">
+  Removes all entries from the store.
+</ResponseField>
+
+---
+
+## `InMemoryStore` class
+
+Default `MemoryStore` implementation backed by a plain `Map`. All data lives in process memory and is never persisted to disk. Suitable for testing and single-process use-cases.
+
+```typescript
+class InMemoryStore implements MemoryStore {
+  // MemoryStore interface
+  async get(key: string): Promise<MemoryEntry | null>
+  async set(key: string, value: string, metadata?: Record<string, unknown>): Promise<void>
+  async list(): Promise<MemoryEntry[]>
+  async delete(key: string): Promise<void>
+  async clear(): Promise<void>
+
+  // Extensions
+  async search(query: string): Promise<MemoryEntry[]>
+  get size(): number
+  has(key: string): boolean
+}
+```
+
+<Note>
+  The async surface is intentional: it lets you swap in an async-native backend (Redis, SQLite) without changing any calling code.
+</Note>
+
+### Extended methods
+
+#### `search(query)`
+
+```typescript
+async search(query: string): Promise<MemoryEntry[]>
+```
+
+Returns entries whose `key` starts with `query` **or** whose `value` contains `query` (case-insensitive substring match). When `query` is empty, returns all entries. This is a linear scan — not suitable for very large stores without an index layer on top.
+
+```typescript
+// Find all entries related to "research"
+const hits = await store.search('research')
+```
+
+#### `size`
+
+```typescript
+get size(): number
+```
+
+Returns the number of entries currently in the store.
+
+#### `has(key)`
+
+```typescript
+has(key: string): boolean
+```
+
+Returns `true` if `key` exists in the store (synchronous).
+
+---
+
+## `SharedMemory` class
+
+Namespaced shared memory for a team of agents. Writes are namespaced as `<agentName>/<key>` so entries from different agents never collide and are always attributable. Any agent may read any entry using the fully-qualified key.
+
+```typescript
+class SharedMemory {
+  constructor()
+
+  async write(agentName: string, key: string, value: string, metadata?: Record<string, unknown>): Promise<void>
+  async read(key: string): Promise<MemoryEntry | null>
+  async listAll(): Promise<MemoryEntry[]>
+  async listByAgent(agentName: string): Promise<MemoryEntry[]>
+  async getSummary(): Promise<string>
+  getStore(): MemoryStore
+}
+```
+
+### Constructor
+
+```typescript
+new SharedMemory()
+```
+
+Creates a new `SharedMemory` instance backed by a fresh `InMemoryStore`.
+
+---
+
+### `write(agentName, key, value, metadata?)`
+
+```typescript
+async write(
+  agentName: string,
+  key: string,
+  value: string,
+  metadata?: Record<string, unknown>,
+): Promise<void>
+```
+
+Writes `value` under the namespaced key `<agentName>/<key>`. Automatically merges `{ agent: agentName }` into `metadata` for provenance tracking.
+
+<ParamField body="agentName" type="string" required>
+  The writing agent's name. Used as the namespace prefix.
+</ParamField>
+
+<ParamField body="key" type="string" required>
+  Logical key within the agent's namespace.
+</ParamField>
+
+<ParamField body="value" type="string" required>
+  Value to store. Serialise objects before writing.
+</ParamField>
+
+<ParamField body="metadata" type="Record<string, unknown>">
+  Extra metadata stored alongside the entry.
+</ParamField>
+
+---
+
+### `read(key)`
+
+```typescript
+async read(key: string): Promise<MemoryEntry | null>
+```
+
+Reads an entry by its fully-qualified key (`<agentName>/<key>`). Returns `null` when the key is absent.
+
+```typescript
+const entry = await mem.read('researcher/findings')
+```
+
+---
+
+### `listAll()`
+
+```typescript
+async listAll(): Promise<MemoryEntry[]>
+```
+
+Returns every entry in the shared store regardless of agent.
+
+---
+
+### `listByAgent(agentName)`
+
+```typescript
+async listByAgent(agentName: string): Promise<MemoryEntry[]>
+```
+
+Returns all entries written by `agentName` — those whose key starts with `<agentName>/`.
+
+---
+
+### `getSummary()`
+
+```typescript
+async getSummary(): Promise<string>
+```
+
+Produces a human-readable summary of all entries in the store, grouped by agent. Returns an empty string when the store is empty. Values longer than 200 characters are truncated with an ellipsis.
+
+The output is designed to be injected into an agent's system prompt or as a user turn so the agent has context about what its teammates know.
+
+```
+## Shared Team Memory
+
+### researcher
+- findings: TypeScript 5.5 ships const type params
+
+### coder
+- plan: Implement feature X using const type params
+```
+
+---
+
+### `getStore()`
+
+```typescript
+getStore(): MemoryStore
+```
+
+Returns the underlying `MemoryStore` for callers that only need the raw key-value interface.
+
+---
+
+## When to use `sharedMemory: true` vs manual `SharedMemory`
+
+<AccordionGroup>
+  <Accordion title="sharedMemory: true in TeamConfig">
+    When you set `sharedMemory: true` in `TeamConfig`, the orchestrator automatically creates a `SharedMemory` instance. After each task completes, its output is written into shared memory under `task:{taskId}:result`. The orchestrator injects a `## Shared Team Memory` summary into subsequent agent prompts so agents can see each other's prior work without any additional setup.
+
+    ```typescript
+    const team: TeamConfig = {
+      name: 'research-team',
+      agents: [researcher, writer],
+      sharedMemory: true,
+    }
+    ```
+
+    Use this when you want automatic memory sharing with minimal configuration.
+  </Accordion>
+
+  <Accordion title="Manual SharedMemory">
+    Instantiate `SharedMemory` directly when you need to:
+    - Pre-populate memory before a run starts.
+    - Read team memory from outside the orchestrator (e.g. in tests or post-run analysis).
+    - Use `getSummary()` to inject context into a custom prompt.
+    - Pass a reference to multiple orchestrator runs so they share state.
+
+    ```typescript
+    const mem = new SharedMemory()
+    await mem.write('system', 'task', 'Summarise Q3 earnings report')
+
+    const team = createTeam({ ..., sharedMemory: true })
+    // Inject the pre-populated store via the run context
+    ```
+  </Accordion>
+</AccordionGroup>

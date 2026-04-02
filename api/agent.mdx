@@ -1,0 +1,586 @@
+---
+title: "Agent & AgentPool"
+description: "Individual agent execution with persistent conversation history, streaming, and dynamic tools. AgentPool manages concurrency across multiple agents."
+---
+
+## Agent
+
+`Agent` is the high-level wrapper around the framework's core conversation loop. It adds persistent conversation history, lifecycle state tracking, streaming support, and dynamic tool management on top of the lower-level `AgentRunner`.
+
+```typescript
+import { Agent } from '@jackchen_me/open-multi-agent'
+```
+
+<Note>
+  In most cases you won't construct `Agent` directly — `OpenMultiAgent.runAgent()` and team-based methods handle instantiation for you. Use the constructor when you need fine-grained control over a single agent's tool registry.
+</Note>
+
+### Constructor
+
+```typescript
+new Agent(config: AgentConfig, toolRegistry: ToolRegistry, toolExecutor: ToolExecutor)
+```
+
+<ParamField body="config" type="AgentConfig" required>
+  Static configuration for the agent. See [AgentConfig](#agentconfig) below.
+</ParamField>
+
+<ParamField body="toolRegistry" type="ToolRegistry" required>
+  Registry used to resolve and manage tools. Inject a shared registry so multiple agents in a team can share tool definitions.
+</ParamField>
+
+<ParamField body="toolExecutor" type="ToolExecutor" required>
+  Executor that dispatches tool calls. Typically constructed alongside the `ToolRegistry`.
+</ParamField>
+
+### AgentConfig
+
+<ParamField body="name" type="string" required>
+  Unique agent identifier used as the key in result maps and for message routing.
+</ParamField>
+
+<ParamField body="model" type="string" required>
+  LLM model identifier, e.g. `'claude-opus-4-6'` or `'gpt-4o'`.
+</ParamField>
+
+<ParamField body="provider" type='"anthropic" | "copilot" | "openai"'>
+  LLM provider. Falls back to the orchestrator's `defaultProvider` (`'anthropic'`) when omitted.
+</ParamField>
+
+<ParamField body="baseURL" type="string">
+  Custom base URL for OpenAI-compatible APIs (Ollama, vLLM, LM Studio, etc.). Local servers that don't require auth still need `apiKey` set to a non-empty placeholder (e.g. `'ollama'`) because the OpenAI SDK validates it.
+</ParamField>
+
+<ParamField body="apiKey" type="string">
+  API key override. Falls back to the provider's standard environment variable when omitted.
+</ParamField>
+
+<ParamField body="systemPrompt" type="string">
+  System prompt prepended to every conversation. Defines the agent's persona and constraints.
+</ParamField>
+
+<ParamField body="tools" type="readonly string[]">
+  Names of tools from the tool registry that are available to this agent. When omitted, all registered tools are available.
+</ParamField>
+
+<ParamField body="maxTurns" type="number" default="10">
+  Maximum number of tool-call round-trips before the runner stops. Prevents unbounded loops.
+</ParamField>
+
+<ParamField body="maxTokens" type="number">
+  Maximum output tokens per LLM response.
+</ParamField>
+
+<ParamField body="temperature" type="number">
+  Sampling temperature passed to the LLM provider.
+</ParamField>
+
+### Properties
+
+<ResponseField name="name" type="string" required>
+  The agent's name, taken from `config.name`.
+</ResponseField>
+
+<ResponseField name="config" type="AgentConfig" required>
+  The original configuration object passed to the constructor.
+</ResponseField>
+
+### Execution methods
+
+#### run
+
+```typescript
+run(prompt: string): Promise<AgentRunResult>
+```
+
+Run `prompt` in a **fresh conversation**. The agent's persistent history is not used or modified. Equivalent to a one-shot query.
+
+---
+
+#### prompt
+
+```typescript
+prompt(message: string): Promise<AgentRunResult>
+```
+
+Run `message` as part of the **ongoing conversation**. Appends the user message to persistent history, runs the agent, then appends the resulting messages to history for the next call. Use this for multi-turn interactions.
+
+---
+
+#### stream
+
+```typescript
+stream(prompt: string): AsyncGenerator<StreamEvent>
+```
+
+Stream a fresh-conversation response. Like `run()`, this does not use or modify the persistent history. Yields `StreamEvent` values incrementally:
+
+| `type`        | `data` type       | Description                                        |
+| ------------- | ----------------- | -------------------------------------------------- |
+| `text`        | `string`          | Incremental text delta from the model.             |
+| `tool_use`    | `ToolUseBlock`    | The model has requested a tool call.               |
+| `tool_result` | `ToolResultBlock` | A tool result has been appended.                   |
+| `done`        | `RunResult`       | The stream has ended; final aggregated result.     |
+| `error`       | `Error`           | An unrecoverable error occurred.                   |
+
+### State and history methods
+
+#### getState
+
+```typescript
+getState(): AgentState
+```
+
+Return a snapshot of the current agent state.
+
+<ResponseField name="status" type='"idle" | "running" | "completed" | "error"' required>
+  Current lifecycle state of the agent.
+</ResponseField>
+
+<ResponseField name="messages" type="LLMMessage[]" required>
+  Messages accumulated in the current or most recent run.
+</ResponseField>
+
+<ResponseField name="tokenUsage" type="TokenUsage" required>
+  Cumulative token usage across all runs since construction or last `reset()`.
+</ResponseField>
+
+<ResponseField name="error" type="Error">
+  Set when `status === 'error'`; contains the thrown error.
+</ResponseField>
+
+---
+
+#### getHistory
+
+```typescript
+getHistory(): LLMMessage[]
+```
+
+Returns a copy of the persistent conversation history (only populated by `prompt()` calls).
+
+---
+
+#### reset
+
+```typescript
+reset(): void
+```
+
+Clear the persistent conversation history and reset state to `idle`. The underlying adapter connection is reused.
+
+### Tool management methods
+
+#### addTool
+
+```typescript
+addTool(tool: ToolDefinition): void
+```
+
+Register a new tool with this agent's tool registry at runtime. The tool becomes available to the next LLM call — no restart required.
+
+---
+
+#### removeTool
+
+```typescript
+removeTool(name: string): void
+```
+
+Deregister a tool by name. No-op if the tool is not registered.
+
+---
+
+#### getTools
+
+```typescript
+getTools(): string[]
+```
+
+Return the names of all currently registered tools.
+
+### AgentState type
+
+<ResponseField name="status" type='"idle" | "running" | "completed" | "error"' required>
+  Lifecycle state. Transitions: `idle → running → completed | error`.
+</ResponseField>
+
+<ResponseField name="messages" type="LLMMessage[]" required>
+  Messages from the current or most recent run.
+</ResponseField>
+
+<ResponseField name="tokenUsage" type="TokenUsage" required>
+  Cumulative token usage. See [TokenUsage](#agentrunresult-type).
+</ResponseField>
+
+<ResponseField name="error" type="Error">
+  The error that caused the `'error'` state, if applicable.
+</ResponseField>
+
+### AgentRunResult type
+
+<ResponseField name="success" type="boolean" required>
+  `true` when the agent completed without throwing.
+</ResponseField>
+
+<ResponseField name="output" type="string" required>
+  The final text output from the last assistant turn.
+</ResponseField>
+
+<ResponseField name="messages" type="LLMMessage[]" required>
+  All messages accumulated during this run (assistant turns and tool results).
+</ResponseField>
+
+<ResponseField name="tokenUsage" type="TokenUsage" required>
+  Aggregated token counts across every LLM call in this run.
+
+  <Expandable title="TokenUsage fields">
+    <ResponseField name="input_tokens" type="number" required>
+      Total input tokens consumed.
+    </ResponseField>
+    <ResponseField name="output_tokens" type="number" required>
+      Total output tokens generated.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="toolCalls" type="ToolCallRecord[]" required>
+  All tool invocations made during this run, in execution order.
+
+  <Expandable title="ToolCallRecord fields">
+    <ResponseField name="toolName" type="string" required>
+      Name of the tool called.
+    </ResponseField>
+    <ResponseField name="input" type="Record<string, unknown>" required>
+      The input object passed to the tool.
+    </ResponseField>
+    <ResponseField name="output" type="string" required>
+      Serialised result returned by the tool.
+    </ResponseField>
+    <ResponseField name="duration" type="number" required>
+      Wall-clock execution time in milliseconds.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## AgentPool
+
+`AgentPool` is a registry and scheduler for a collection of `Agent` instances. It enforces a concurrency cap across all parallel runs via an internal `Semaphore`.
+
+```typescript
+import { AgentPool } from '@jackchen_me/open-multi-agent'
+```
+
+### Constructor
+
+```typescript
+new AgentPool(maxConcurrency?: number)
+```
+
+<ParamField body="maxConcurrency" type="number" default="5">
+  Maximum number of agent runs allowed at the same time across the whole pool. Runs that exceed the limit queue via the semaphore and proceed as slots become available.
+</ParamField>
+
+### Registry methods
+
+#### add
+
+```typescript
+add(agent: Agent): void
+```
+
+Register an agent with the pool. Throws if an agent with the same name is already registered.
+
+---
+
+#### remove
+
+```typescript
+remove(name: string): void
+```
+
+Unregister an agent by name. Throws if the agent is not found.
+
+---
+
+#### get
+
+```typescript
+get(name: string): Agent | undefined
+```
+
+Retrieve a registered agent by name, or `undefined` if not found.
+
+---
+
+#### list
+
+```typescript
+list(): Agent[]
+```
+
+Return all registered agents in insertion order.
+
+### Execution methods
+
+#### run
+
+```typescript
+run(agentName: string, prompt: string): Promise<AgentRunResult>
+```
+
+Run a single prompt on the named agent, respecting the pool's concurrency limit. Throws if the agent name is not registered.
+
+---
+
+#### runParallel
+
+```typescript
+runParallel(
+  tasks: ReadonlyArray<{ readonly agent: string; readonly prompt: string }>
+): Promise<Map<string, AgentRunResult>>
+```
+
+Run prompts on multiple agents in parallel, subject to the concurrency cap. Results are returned as a `Map<agentName, AgentRunResult>`. Failed runs are surfaced as error `AgentRunResult` entries in the map rather than thrown exceptions.
+
+<ParamField body="tasks" type="ReadonlyArray<{ agent: string; prompt: string }>" required>
+  Array of `{ agent, prompt }` descriptors. Each `agent` value must be a registered agent name.
+</ParamField>
+
+<Note>
+  If two tasks target the same agent name, the map will only contain the last result. Use unique agent names or run duplicates sequentially.
+</Note>
+
+---
+
+#### runAny
+
+```typescript
+runAny(prompt: string): Promise<AgentRunResult>
+```
+
+Run a prompt on the next available agent using **round-robin** selection. Agents are selected in insertion order, cycling back to the start. The concurrency limit is still enforced. Throws if the pool is empty.
+
+### Observability methods
+
+#### getStatus
+
+```typescript
+getStatus(): PoolStatus
+```
+
+Returns a snapshot of how many agents are in each lifecycle state.
+
+<ResponseField name="total" type="number" required>
+  Total number of agents registered in the pool.
+</ResponseField>
+
+<ResponseField name="idle" type="number" required>
+  Agents currently in `idle` state.
+</ResponseField>
+
+<ResponseField name="running" type="number" required>
+  Agents currently in `running` state.
+</ResponseField>
+
+<ResponseField name="completed" type="number" required>
+  Agents currently in `completed` state.
+</ResponseField>
+
+<ResponseField name="error" type="number" required>
+  Agents currently in `error` state.
+</ResponseField>
+
+### Lifecycle methods
+
+#### shutdown
+
+```typescript
+shutdown(): Promise<void>
+```
+
+Reset all agents in the pool — clears conversation histories and returns them to `idle` state. Does not remove agents from the pool.
+
+---
+
+## Semaphore
+
+`Semaphore` is the concurrency primitive used internally by `AgentPool`. It can be imported and used standalone for other rate-limiting scenarios.
+
+```typescript
+import { Semaphore } from '@jackchen_me/open-multi-agent'
+```
+
+### Constructor
+
+```typescript
+new Semaphore(limit: number)
+```
+
+<ParamField body="limit" type="number" required>
+  Maximum number of concurrent operations permitted at any one time.
+</ParamField>
+
+### Methods
+
+#### acquire
+
+```typescript
+acquire(): Promise<void>
+```
+
+Wait until a slot is available, then claim it. Returns a promise that resolves when the caller may proceed.
+
+---
+
+#### release
+
+```typescript
+release(): void
+```
+
+Return a slot to the semaphore. Always pair with a prior `acquire()` call, typically in a `finally` block:
+
+```typescript
+await semaphore.acquire()
+try {
+  await doWork()
+} finally {
+  semaphore.release()
+}
+```
+
+---
+
+#### run
+
+```typescript
+run<T>(fn: () => Promise<T>): Promise<T>
+```
+
+Convenience wrapper that acquires a slot, runs `fn`, then releases the slot automatically even if `fn` throws. Prefer this over manual `acquire`/`release` pairs.
+
+```typescript
+const result = await semaphore.run(() => fetchData(url))
+```
+
+---
+
+### Properties
+
+<ResponseField name="active" type="number" required>
+  Number of slots currently in use.
+</ResponseField>
+
+<ResponseField name="pending" type="number" required>
+  Number of callers currently waiting for a slot.
+</ResponseField>
+
+## Complete example
+
+<CodeGroup>
+
+```typescript Single agent
+import { Agent } from '@jackchen_me/open-multi-agent'
+import { ToolRegistry } from '@jackchen_me/open-multi-agent'
+import { ToolExecutor } from '@jackchen_me/open-multi-agent'
+
+const registry = new ToolRegistry()
+const executor = new ToolExecutor(registry)
+
+const agent = new Agent(
+  {
+    name: 'researcher',
+    model: 'claude-opus-4-6',
+    systemPrompt: 'You are a rigorous research assistant. Cite sources.',
+    maxTurns: 5,
+    temperature: 0.3,
+  },
+  registry,
+  executor,
+)
+
+// One-shot run — no history
+const result = await agent.run('Summarise the key findings of the 2024 State of JS survey.')
+console.log(result.output)
+console.log('Tool calls:', result.toolCalls.length)
+
+// Multi-turn conversation
+await agent.prompt('Focus specifically on framework adoption trends.')
+const followUp = await agent.prompt('Which framework grew the most year-over-year?')
+console.log(followUp.output)
+
+// Streaming
+for await (const event of agent.stream('What is a TypeScript discriminated union?')) {
+  if (event.type === 'text') process.stdout.write(event.data as string)
+  if (event.type === 'done') console.log('\nDone.')
+}
+```
+
+```typescript AgentPool (fan-out)
+import { AgentPool, Agent } from '@jackchen_me/open-multi-agent'
+import { ToolRegistry } from '@jackchen_me/open-multi-agent'
+import { ToolExecutor } from '@jackchen_me/open-multi-agent'
+
+function makeAgent(name: string, systemPrompt: string): Agent {
+  const registry = new ToolRegistry()
+  const executor = new ToolExecutor(registry)
+  return new Agent({ name, model: 'claude-opus-4-6', systemPrompt }, registry, executor)
+}
+
+const pool = new AgentPool(3) // max 3 concurrent runs
+
+pool.add(makeAgent('analyst',  'You analyse data and spot trends.'))
+pool.add(makeAgent('writer',   'You write clear technical prose.'))
+pool.add(makeAgent('reviewer', 'You review content for accuracy.'))
+
+// Fan-out: run all three in parallel (capped at 3)
+const results = await pool.runParallel([
+  { agent: 'analyst',  prompt: 'Analyse Q4 2024 revenue trends.' },
+  { agent: 'writer',   prompt: 'Draft an executive summary for the board.' },
+  { agent: 'reviewer', prompt: 'Check the draft for factual errors.' },
+])
+
+for (const [name, result] of results) {
+  console.log(`[${name}]: ${result.success ? 'OK' : 'FAILED'}`)
+  console.log(result.output)
+}
+
+// Pool health
+const status = pool.getStatus()
+console.log(`Idle: ${status.idle}, Running: ${status.running}, Error: ${status.error}`)
+
+await pool.shutdown()
+```
+
+```typescript Semaphore standalone
+import { Semaphore } from '@jackchen_me/open-multi-agent'
+
+const sem = new Semaphore(2) // allow 2 concurrent API calls
+
+async function fetchWithLimit(url: string): Promise<string> {
+  await sem.acquire()
+  try {
+    const res = await fetch(url)
+    return res.text()
+  } finally {
+    sem.release()
+  }
+}
+
+const urls = ['https://example.com/a', 'https://example.com/b', 'https://example.com/c']
+const pages = await Promise.all(urls.map(fetchWithLimit))
+```
+
+</CodeGroup>
+
+<CardGroup cols={2}>
+  <Card title="OpenMultiAgent" icon="sitemap" href="/api/orchestrator">
+    Top-level orchestrator that composes teams and agents.
+  </Card>
+  <Card title="Team" icon="users" href="/api/team">
+    Agent rosters, messaging, and shared memory.
+  </Card>
+</CardGroup>

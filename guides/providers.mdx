@@ -1,0 +1,295 @@
+---
+title: Providers
+description: Configure Anthropic, OpenAI, GitHub Copilot, and any OpenAI-compatible API
+---
+
+Open Multi-Agent ships with three built-in providers: Anthropic, OpenAI, and GitHub Copilot. Any OpenAI-compatible API — DeepSeek, Groq, Mistral, Qwen, and others — works via `provider: 'openai'` with a custom `baseURL`. Local models follow the same pattern; see [Local Models](/guides/local-models).
+
+## Supported providers
+
+| Provider | `provider` value | Env var | Status |
+|----------|-----------------|---------|--------|
+| Anthropic (Claude) | `'anthropic'` | `ANTHROPIC_API_KEY` | Verified |
+| OpenAI (GPT) | `'openai'` | `OPENAI_API_KEY` | Verified |
+| GitHub Copilot | `'copilot'` | `GITHUB_TOKEN` | Verified |
+| Ollama / vLLM / LM Studio | `'openai'` + `baseURL` | — | Verified |
+| DeepSeek / Groq / Mistral / Qwen | `'openai'` + `baseURL` | varies | Community |
+
+<Note>
+  Community-verified providers (DeepSeek, Groq, Mistral, etc.) use the same `provider: 'openai'` + `baseURL` pattern. They have not been fully verified by the core team — contributions are welcome via [issue #25](https://github.com/JackChen-me/open-multi-agent/issues/25).
+</Note>
+
+---
+
+## Anthropic
+
+Set `provider: 'anthropic'` on any `AgentConfig`. The adapter reads `ANTHROPIC_API_KEY` from the environment automatically.
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+import type { AgentConfig } from '@jackchen_me/open-multi-agent'
+
+const agent: AgentConfig = {
+  name: 'writer',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: 'You are a concise technical writer.',
+  tools: ['file_write'],
+  maxTurns: 6,
+}
+
+const orchestrator = new OpenMultiAgent({ defaultModel: 'claude-sonnet-4-6' })
+const result = await orchestrator.runAgent(agent, 'Write a one-paragraph intro to TypeScript generics.')
+console.log(result.output)
+```
+
+**Models:** `claude-sonnet-4-6`, `claude-opus-4-6`, and any other model ID listed in the [Anthropic docs](https://docs.anthropic.com/en/docs/about-claude/models).
+
+**Environment variable:**
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+You can also pass the key directly to bypass the env var:
+
+```typescript
+const agent: AgentConfig = {
+  name: 'writer',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  apiKey: 'sk-ant-...', // overrides ANTHROPIC_API_KEY
+}
+```
+
+<Tip>
+  Set `temperature: 0` for deterministic tasks like code generation or data extraction. Use higher values (0.3–0.7) for creative or analytical writing.
+</Tip>
+
+---
+
+## OpenAI
+
+Set `provider: 'openai'`. The adapter reads `OPENAI_API_KEY` from the environment.
+
+```typescript
+const agent: AgentConfig = {
+  name: 'analyst',
+  model: 'gpt-4o',
+  provider: 'openai',
+  systemPrompt: 'You are a data analyst. Be concise and precise.',
+  tools: ['file_read', 'bash'],
+  maxTurns: 8,
+  temperature: 0,
+}
+```
+
+**Models:** `gpt-4o`, `gpt-4o-mini`, and any other model ID supported by the OpenAI API.
+
+**Environment variable:**
+
+```bash
+export OPENAI_API_KEY=sk-...
+```
+
+---
+
+## GitHub Copilot
+
+Set `provider: 'copilot'`. The adapter authenticates with your GitHub account using `GITHUB_COPILOT_TOKEN` or `GITHUB_TOKEN`. If neither is set, an interactive OAuth2 device flow launches in your browser.
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+import type { OrchestratorEvent } from '@jackchen_me/open-multi-agent'
+
+const orchestrator = new OpenMultiAgent({
+  defaultModel: 'gpt-4o',
+  defaultProvider: 'copilot',
+  onProgress: (event: OrchestratorEvent) => {
+    if (event.type === 'agent_start') console.log(`[start]    agent=${event.agent}`)
+    else if (event.type === 'agent_complete') console.log(`[complete] agent=${event.agent}`)
+  },
+})
+
+const result = await orchestrator.runAgent(
+  {
+    name: 'assistant',
+    model: 'gpt-4o',
+    provider: 'copilot',
+    systemPrompt: 'You are a helpful assistant. Keep answers brief.',
+    maxTurns: 1,
+    maxTokens: 256,
+  },
+  'What is 2 + 2? Reply in one sentence.',
+)
+
+console.log(result.output)
+```
+
+**Environment variables (checked in order):**
+
+```bash
+# Preferred: a pre-issued Copilot token
+export GITHUB_COPILOT_TOKEN=...
+
+# Fallback: a GitHub personal access token with Copilot scope
+export GITHUB_TOKEN=...
+```
+
+<Note>
+  `baseURL` is not supported for the `copilot` provider and will be ignored with a warning if supplied.
+</Note>
+
+**Models:** Copilot exposes OpenAI-compatible models via the GitHub API. `gpt-4o` is the recommended default.
+
+---
+
+## OpenAI-compatible APIs
+
+Any API that implements the OpenAI chat-completions protocol works via `provider: 'openai'` and a `baseURL` pointing at the compatible endpoint. This covers DeepSeek, Groq, Mistral, Qwen, MiniMax, and many others.
+
+<Tabs>
+  <Tab title="DeepSeek">
+
+```typescript
+const agent: AgentConfig = {
+  name: 'coder',
+  model: 'deepseek-coder',
+  provider: 'openai',
+  baseURL: 'https://api.deepseek.com/v1',
+  apiKey: process.env.DEEPSEEK_API_KEY,
+  systemPrompt: 'You are an expert programmer.',
+  maxTurns: 8,
+}
+```
+
+  </Tab>
+  <Tab title="Groq">
+
+```typescript
+const agent: AgentConfig = {
+  name: 'fast-agent',
+  model: 'llama3-70b-8192',
+  provider: 'openai',
+  baseURL: 'https://api.groq.com/openai/v1',
+  apiKey: process.env.GROQ_API_KEY,
+  systemPrompt: 'You are a helpful assistant.',
+  maxTurns: 4,
+}
+```
+
+  </Tab>
+  <Tab title="Mistral">
+
+```typescript
+const agent: AgentConfig = {
+  name: 'analyst',
+  model: 'mistral-large-latest',
+  provider: 'openai',
+  baseURL: 'https://api.mistral.ai/v1',
+  apiKey: process.env.MISTRAL_API_KEY,
+  systemPrompt: 'You are a data analyst.',
+  maxTurns: 6,
+}
+```
+
+  </Tab>
+</Tabs>
+
+The `apiKey` field is always required by the OpenAI SDK, even if the remote server doesn't check it. Pass the appropriate key for each service.
+
+---
+
+## Mixing providers in one team
+
+Agents in the same team can each use a different provider. The following example — adapted from [`examples/04-multi-model-team.ts`](https://github.com/JackChen-me/open-multi-agent/blob/main/examples/04-multi-model-team.ts) — pairs a Claude researcher with a GPT analyst:
+
+```typescript
+import { Agent, AgentPool, ToolRegistry, ToolExecutor, registerBuiltInTools, defineTool } from '@jackchen_me/open-multi-agent'
+import type { AgentConfig } from '@jackchen_me/open-multi-agent'
+
+// Researcher — Anthropic Claude
+const researcherConfig: AgentConfig = {
+  name: 'researcher',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: `You are a financial data researcher.
+Use the get_exchange_rate tool to fetch current rates between the currency pairs you are given.
+Return the raw rates as a JSON object keyed by pair, e.g. { "USD/EUR": 0.91, "USD/GBP": 0.79 }.`,
+  tools: ['get_exchange_rate'],
+  maxTurns: 6,
+  temperature: 0,
+}
+
+// Analyst — OpenAI GPT-4o (falls back to Claude if OPENAI_API_KEY is unset)
+const useOpenAI = Boolean(process.env.OPENAI_API_KEY)
+
+const analystConfig: AgentConfig = {
+  name: 'analyst',
+  model: useOpenAI ? 'gpt-4o' : 'claude-sonnet-4-6',
+  provider: useOpenAI ? 'openai' : 'anthropic',
+  systemPrompt: `You are a foreign exchange analyst.
+You receive exchange rate data and produce a short briefing.
+Use format_currency to show example conversions.
+Keep the briefing under 200 words.`,
+  tools: ['format_currency'],
+  maxTurns: 4,
+  temperature: 0.3,
+}
+
+// Build agents with custom tools registered
+function buildCustomAgent(config: AgentConfig, extraTools: ReturnType<typeof defineTool>[]) {
+  const registry = new ToolRegistry()
+  registerBuiltInTools(registry)
+  for (const tool of extraTools) registry.register(tool)
+  const executor = new ToolExecutor(registry)
+  return new Agent(config, registry, executor)
+}
+
+const researcher = buildCustomAgent(researcherConfig, [exchangeRateTool])
+const analyst = buildCustomAgent(analystConfig, [formatCurrencyTool])
+
+// Run sequentially through an AgentPool
+const pool = new AgentPool(1)
+pool.add(researcher)
+pool.add(analyst)
+
+const researchResult = await pool.run('researcher', 'Fetch USD/EUR, USD/GBP, USD/JPY rates.')
+const analystResult = await pool.run('analyst', `Rates: ${researchResult.output}\nWrite a brief FX market summary.`)
+
+console.log(analystResult.output)
+```
+
+<Tip>
+  Use `AgentPool` when you need direct control over which agent runs which prompt. Use `orchestrator.runTeam()` when you want the framework to decompose the goal automatically.
+</Tip>
+
+Each agent resolves its provider, `apiKey`, and `baseURL` independently — there is no global provider for a team. You can combine Anthropic, OpenAI, Copilot, and local models in any configuration.
+
+---
+
+## AgentConfig provider fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | `'anthropic' \| 'openai' \| 'copilot'` | Which LLM provider to target. Defaults to the orchestrator's `defaultProvider`. |
+| `model` | `string` | Provider-specific model ID, e.g. `'claude-sonnet-4-6'` or `'gpt-4o'`. |
+| `apiKey` | `string` | Optional key override. Falls back to the provider's standard env var. |
+| `baseURL` | `string` | Optional base URL for OpenAI-compatible endpoints. Not supported for `copilot`. |
+
+---
+
+<CardGroup cols={2}>
+  <Card title="Local Models" icon="server" href="/guides/local-models">
+    Run Ollama, vLLM, or LM Studio alongside cloud agents in the same team.
+  </Card>
+  <Card title="Custom Tools" icon="wrench" href="/guides/custom-tools">
+    Define your own tools with Zod schemas and wire them to any agent.
+  </Card>
+  <Card title="Team Orchestration" icon="users" href="/guides/team-orchestration">
+    Mix providers across agents in an auto-orchestrated team.
+  </Card>
+  <Card title="Types reference" icon="code" href="/api/types">
+    Full TypeScript type definitions for AgentConfig, OrchestratorConfig, and more.
+  </Card>
+</CardGroup>

@@ -1,0 +1,298 @@
+---
+title: Local Models
+description: Run Open Multi-Agent with Ollama, vLLM, LM Studio, or any local OpenAI-compatible server
+---
+
+Local models plug into the framework through the `provider: 'openai'` adapter plus a custom `baseURL`. The adapter speaks the OpenAI chat-completions protocol — which Ollama, vLLM, LM Studio, and llama.cpp all implement — so no additional code or dependencies are needed.
+
+<Note>
+  The OpenAI SDK validates that `apiKey` is a non-empty string even when the server doesn't require authentication. Pass a placeholder such as `'ollama'` to satisfy the check.
+</Note>
+
+---
+
+## Supported local servers
+
+| Server | Default endpoint | `model` value |
+|--------|-----------------|---------------|
+| [Ollama](https://ollama.com) | `http://localhost:11434/v1` | Exact tag, e.g. `'llama3.1'` |
+| [vLLM](https://github.com/vllm-project/vllm) | `http://localhost:8000/v1` | HuggingFace model ID |
+| [LM Studio](https://lmstudio.ai) | `http://localhost:1234/v1` | As shown in LM Studio UI |
+| [llama.cpp server](https://github.com/ggerganov/llama.cpp) | `http://localhost:8080/v1` | `'default'` or model name |
+
+---
+
+## Setting up Ollama
+
+<Steps>
+  <Step title="Install Ollama">
+    Download and install Ollama from [ollama.com](https://ollama.com). The installer adds the `ollama` CLI and starts a background service automatically.
+
+    ```bash
+    # macOS / Linux
+    curl -fsSL https://ollama.com/install.sh | sh
+    ```
+  </Step>
+  <Step title="Pull a model">
+    ```bash
+    ollama pull llama3.1
+    ```
+
+    Other popular choices: `mistral`, `codellama`, `gemma3`, `phi3`.
+  </Step>
+  <Step title="Verify the server is running">
+    Ollama starts on port 11434 by default. Confirm it is up:
+
+    ```bash
+    curl http://localhost:11434/v1/models
+    ```
+
+    You should see a JSON list of available models.
+  </Step>
+</Steps>
+
+---
+
+## Basic Ollama agent
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+import type { AgentConfig } from '@jackchen_me/open-multi-agent'
+
+const localAgent: AgentConfig = {
+  name: 'reviewer',
+  model: 'llama3.1',
+  provider: 'openai',          // OpenAI-compatible protocol
+  baseURL: 'http://localhost:11434/v1',
+  apiKey: 'ollama',            // placeholder — Ollama ignores this value
+  systemPrompt: 'You are a helpful code reviewer. Be concise and specific.',
+  tools: ['file_read'],
+  maxTurns: 4,
+}
+
+const orchestrator = new OpenMultiAgent({ maxConcurrency: 1 })
+
+const result = await orchestrator.runAgent(
+  localAgent,
+  'Read /tmp/example.ts and give me three concrete improvement suggestions.',
+)
+
+console.log(result.output)
+```
+
+<Tip>
+  Local models are generally slower than cloud APIs. Set a realistic `maxTurns` (2–4) and avoid heavy tool-calling loops unless your hardware can sustain the throughput.
+</Tip>
+
+---
+
+## Mixing a local model with a cloud model
+
+The real power of the `baseURL` pattern is combining a fast cloud model for generation-heavy tasks with a local model for tasks where privacy or cost matters — in the same pipeline.
+
+The following example is drawn from [`examples/06-local-model.ts`](https://github.com/JackChen-me/open-multi-agent/blob/main/examples/06-local-model.ts). A Claude agent writes code; an Ollama agent reviews it.
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+import type { AgentConfig, OrchestratorEvent, Task } from '@jackchen_me/open-multi-agent'
+
+// Coder — uses Claude (Anthropic) for high-quality code generation
+const coder: AgentConfig = {
+  name: 'coder',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: `You are a senior TypeScript developer. Write clean, well-typed,
+production-quality code. Use the tools to write files to /tmp/local-model-demo/.
+Always include brief JSDoc comments on exported functions.`,
+  tools: ['bash', 'file_write'],
+  maxTurns: 6,
+}
+
+// Reviewer — uses a local Ollama model via the OpenAI-compatible API.
+// The apiKey is required by the OpenAI SDK but Ollama ignores it,
+// so we pass the placeholder string 'ollama'.
+const reviewer: AgentConfig = {
+  name: 'reviewer',
+  model: 'llama3.1',
+  provider: 'openai', // 'openai' here means "OpenAI-compatible protocol", not the OpenAI cloud
+  baseURL: 'http://localhost:11434/v1',
+  apiKey: 'ollama',
+  systemPrompt: `You are a code reviewer. You read source files and produce a structured review.
+Your review MUST include these sections:
+- Summary (2-3 sentences)
+- Strengths (bullet list)
+- Issues (bullet list — or "None found" if the code is clean)
+- Verdict: SHIP or NEEDS WORK
+
+Be specific and constructive. Reference line numbers or function names when possible.`,
+  tools: ['file_read'],
+  maxTurns: 4,
+}
+
+// Progress logging
+const taskTimes = new Map<string, number>()
+
+function handleProgress(event: OrchestratorEvent): void {
+  const ts = new Date().toISOString().slice(11, 23)
+  switch (event.type) {
+    case 'task_start':
+      taskTimes.set(event.task ?? '', Date.now())
+      console.log(`[${ts}] TASK START  task=${event.task}`)
+      break
+    case 'task_complete':
+      const elapsed = Date.now() - (taskTimes.get(event.task ?? '') ?? Date.now())
+      console.log(`[${ts}] TASK DONE   task=${event.task} in ${elapsed}ms`)
+      break
+    case 'agent_start':
+      console.log(`[${ts}] AGENT START ${event.agent}`)
+      break
+    case 'agent_complete':
+      console.log(`[${ts}] AGENT DONE  ${event.agent}`)
+      break
+  }
+}
+
+// Orchestrator and team
+const orchestrator = new OpenMultiAgent({
+  defaultModel: 'claude-sonnet-4-6',
+  maxConcurrency: 2,
+  onProgress: handleProgress,
+})
+
+const team = orchestrator.createTeam('local-cloud-team', {
+  name: 'local-cloud-team',
+  agents: [coder, reviewer],
+  sharedMemory: true,
+})
+
+// Explicit task pipeline: coder writes → reviewer reviews
+const tasks: Array<{
+  title: string
+  description: string
+  assignee?: string
+  dependsOn?: string[]
+}> = [
+  {
+    title: 'Write: retry utility',
+    description: `Write a TypeScript retry utility to /tmp/local-model-demo/retry.ts
+with exponential backoff, then run a quick test with npx tsx.`,
+    assignee: 'coder',
+  },
+  {
+    title: 'Review: retry utility',
+    description: `Read /tmp/local-model-demo/retry.ts and produce a structured code review.`,
+    assignee: 'reviewer',
+    dependsOn: ['Write: retry utility'],
+  },
+]
+
+const result = await orchestrator.runTasks(team, tasks)
+
+console.log(`\nSuccess: ${result.success}`)
+console.log(`Tokens — input: ${result.totalTokenUsage.input_tokens}, output: ${result.totalTokenUsage.output_tokens}`)
+
+// Print the local model's review
+const review = result.agentResults.get('reviewer')
+if (review?.success) {
+  console.log('\nCode review (from local model):')
+  console.log(review.output)
+}
+```
+
+<Warning>
+  The `dependsOn` field uses task **titles** as identifiers, not IDs. Ensure the title in `dependsOn` matches exactly — including capitalisation and punctuation.
+</Warning>
+
+---
+
+## Other local servers
+
+The `baseURL` and `apiKey` pattern works with any OpenAI-compatible server. Change the values to match your setup:
+
+<Tabs>
+  <Tab title="vLLM">
+
+```typescript
+const agent: AgentConfig = {
+  name: 'agent',
+  model: 'meta-llama/Meta-Llama-3.1-8B-Instruct',
+  provider: 'openai',
+  baseURL: 'http://localhost:8000/v1',
+  apiKey: 'vllm',  // placeholder
+  maxTurns: 4,
+}
+```
+
+Start vLLM:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --port 8000
+```
+
+  </Tab>
+  <Tab title="LM Studio">
+
+```typescript
+const agent: AgentConfig = {
+  name: 'agent',
+  model: 'lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF',
+  provider: 'openai',
+  baseURL: 'http://localhost:1234/v1',
+  apiKey: 'lmstudio',  // placeholder
+  maxTurns: 4,
+}
+```
+
+Start the local server in LM Studio via **Local Server → Start Server**.
+
+  </Tab>
+  <Tab title="llama.cpp">
+
+```typescript
+const agent: AgentConfig = {
+  name: 'agent',
+  model: 'default',
+  provider: 'openai',
+  baseURL: 'http://localhost:8080/v1',
+  apiKey: 'llamacpp',  // placeholder
+  maxTurns: 4,
+}
+```
+
+Start the llama.cpp server:
+
+```bash
+./llama-server -m /path/to/model.gguf --port 8080
+```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Key points
+
+- Use `provider: 'openai'` — this selects the OpenAI-compatible adapter, not the OpenAI cloud.
+- Set `baseURL` to your server's `/v1` endpoint.
+- Set `apiKey` to any non-empty string (e.g. `'ollama'`). The OpenAI SDK requires it; local servers ignore it.
+- The `model` value must match the exact name your server expects. For Ollama, this is the tag you pulled (`llama3.1`, `mistral`, etc.).
+- Local and cloud agents can share a team, shared memory, and a task pipeline without any special configuration.
+
+---
+
+<CardGroup cols={2}>
+  <Card title="Providers" icon="plug" href="/guides/providers">
+    Anthropic, OpenAI, Copilot, and OpenAI-compatible cloud APIs.
+  </Card>
+  <Card title="Task Pipeline" icon="list-check" href="/guides/task-pipeline">
+    Define explicit dependency graphs with dependsOn and assignee.
+  </Card>
+  <Card title="Custom Tools" icon="wrench" href="/guides/custom-tools">
+    Give your local model agents custom tools with defineTool().
+  </Card>
+  <Card title="Types reference" icon="code" href="/api/types">
+    Full TypeScript types for AgentConfig, TeamConfig, and more.
+  </Card>
+</CardGroup>

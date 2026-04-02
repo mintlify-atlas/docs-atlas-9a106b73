@@ -1,0 +1,438 @@
+---
+title: "Type Reference"
+description: "Complete reference of all exported TypeScript types in the open-multi-agent framework, grouped by domain."
+---
+
+A complete listing of every exported type. All types are importable from `'open-multi-agent'`.
+
+<AccordionGroup>
+
+  <Accordion title="Content Blocks">
+    Content blocks are the unit of communication between the framework and LLM providers. A message's `content` field is an array of these blocks.
+
+    ```typescript
+    /** Plain-text content produced by a model or supplied by the user. */
+    interface TextBlock {
+      readonly type: 'text'
+      readonly text: string
+    }
+    ```
+
+    ```typescript
+    /**
+     * A request by the model to invoke a named tool with a structured input.
+     * The `id` is unique per turn and is referenced by ToolResultBlock.
+     */
+    interface ToolUseBlock {
+      readonly type: 'tool_use'
+      readonly id: string
+      readonly name: string
+      readonly input: Record<string, unknown>
+    }
+    ```
+
+    ```typescript
+    /**
+     * The result of executing a tool, keyed back to the originating
+     * ToolUseBlock via `tool_use_id`.
+     */
+    interface ToolResultBlock {
+      readonly type: 'tool_result'
+      readonly tool_use_id: string
+      readonly content: string
+      readonly is_error?: boolean
+    }
+    ```
+
+    ```typescript
+    /** A base64-encoded image passed to or returned from a model. */
+    interface ImageBlock {
+      readonly type: 'image'
+      readonly source: {
+        readonly type: 'base64'
+        readonly media_type: string
+        readonly data: string
+      }
+    }
+    ```
+
+    ```typescript
+    /** Union of all content block variants that may appear in a message. */
+    type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ImageBlock
+    ```
+  </Accordion>
+
+  <Accordion title="LLM">
+    Types for messages, responses, and adapter configuration.
+
+    ```typescript
+    /**
+     * A single message in a conversation thread.
+     * System messages are passed separately via LLMChatOptions.systemPrompt.
+     */
+    interface LLMMessage {
+      readonly role: 'user' | 'assistant'
+      readonly content: ContentBlock[]
+    }
+    ```
+
+    ```typescript
+    /** Token accounting for a single API call. */
+    interface TokenUsage {
+      readonly input_tokens: number
+      readonly output_tokens: number
+    }
+    ```
+
+    ```typescript
+    /** Normalised response returned by every LLMAdapter implementation. */
+    interface LLMResponse {
+      readonly id: string
+      readonly content: ContentBlock[]
+      readonly model: string
+      readonly stop_reason: string
+      readonly usage: TokenUsage
+    }
+    ```
+
+    ```typescript
+    /** Options shared by both chat and streaming calls. */
+    interface LLMChatOptions {
+      readonly model: string
+      readonly tools?: readonly LLMToolDef[]
+      readonly maxTokens?: number
+      readonly temperature?: number
+      readonly systemPrompt?: string
+      readonly abortSignal?: AbortSignal
+    }
+    ```
+
+    ```typescript
+    /**
+     * Options for streaming calls.
+     * Extends LLMChatOptions without additional fields.
+     */
+    interface LLMStreamOptions extends LLMChatOptions {}
+    ```
+
+    ```typescript
+    /** Provider-agnostic interface that every LLM backend must implement. */
+    interface LLMAdapter {
+      readonly name: string
+      chat(messages: LLMMessage[], options: LLMChatOptions): Promise<LLMResponse>
+      stream(messages: LLMMessage[], options: LLMStreamOptions): AsyncIterable<StreamEvent>
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Tools">
+    Types for tool definitions, execution context, and results.
+
+    ```typescript
+    /** The serialisable tool schema sent to the LLM provider. */
+    interface LLMToolDef {
+      readonly name: string
+      readonly description: string
+      /** JSON Schema object describing the tool's input parameter. */
+      readonly inputSchema: Record<string, unknown>
+    }
+    ```
+
+    ```typescript
+    /**
+     * A tool registered with the framework.
+     *
+     * inputSchema is a Zod schema used for validation before execute is called.
+     * At API call time it is converted to JSON Schema via LLMToolDef.
+     */
+    interface ToolDefinition<TInput = Record<string, unknown>> {
+      readonly name: string
+      readonly description: string
+      readonly inputSchema: ZodSchema<TInput>
+      execute(input: TInput, context: ToolUseContext): Promise<ToolResult>
+    }
+    ```
+
+    ```typescript
+    /** Value returned by a tool's execute function. */
+    interface ToolResult {
+      readonly data: string
+      readonly isError?: boolean
+    }
+    ```
+
+    ```typescript
+    /** Context injected into every tool execution. */
+    interface ToolUseContext {
+      readonly agent: AgentInfo
+      readonly team?: TeamInfo
+      readonly abortSignal?: AbortSignal
+      readonly abortController?: AbortController
+      readonly cwd?: string
+      readonly metadata?: Readonly<Record<string, unknown>>
+    }
+    ```
+
+    ```typescript
+    /** Minimal descriptor for the agent that is invoking a tool. */
+    interface AgentInfo {
+      readonly name: string
+      readonly role: string
+      readonly model: string
+    }
+    ```
+
+    ```typescript
+    /** Descriptor for a team of agents with shared memory. */
+    interface TeamInfo {
+      readonly name: string
+      readonly agents: readonly string[]
+      readonly sharedMemory: MemoryStore
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Agent">
+    Types for configuring, running, and tracking the state of individual agents.
+
+    ```typescript
+    /** Static configuration for a single agent. */
+    interface AgentConfig {
+      readonly name: string
+      readonly model: string
+      readonly provider?: 'anthropic' | 'copilot' | 'openai'
+      /**
+       * Custom base URL for OpenAI-compatible APIs (Ollama, vLLM, LM Studio, etc.).
+       * Note: local servers that don't require auth still need apiKey set to a
+       * non-empty placeholder (e.g. 'ollama') because the OpenAI SDK validates it.
+       */
+      readonly baseURL?: string
+      readonly apiKey?: string
+      readonly systemPrompt?: string
+      readonly tools?: readonly string[]
+      readonly maxTurns?: number
+      readonly maxTokens?: number
+      readonly temperature?: number
+    }
+    ```
+
+    ```typescript
+    /** Lifecycle state tracked during an agent run. */
+    interface AgentState {
+      status: 'idle' | 'running' | 'completed' | 'error'
+      messages: LLMMessage[]
+      tokenUsage: TokenUsage
+      error?: Error
+    }
+    ```
+
+    ```typescript
+    /** A single recorded tool invocation within a run. */
+    interface ToolCallRecord {
+      readonly toolName: string
+      readonly input: Record<string, unknown>
+      readonly output: string
+      /** Wall-clock duration in milliseconds. */
+      readonly duration: number
+    }
+    ```
+
+    ```typescript
+    /** The final result produced when an agent run completes (or fails). */
+    interface AgentRunResult {
+      readonly success: boolean
+      readonly output: string
+      readonly messages: LLMMessage[]
+      readonly tokenUsage: TokenUsage
+      readonly toolCalls: ToolCallRecord[]
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Team">
+    Types for multi-agent team configuration and results.
+
+    ```typescript
+    /** Static configuration for a team of cooperating agents. */
+    interface TeamConfig {
+      readonly name: string
+      readonly agents: readonly AgentConfig[]
+      readonly sharedMemory?: boolean
+      readonly maxConcurrency?: number
+    }
+    ```
+
+    ```typescript
+    /** Aggregated result for a full team run. */
+    interface TeamRunResult {
+      readonly success: boolean
+      /** Keyed by agent name. */
+      readonly agentResults: Map<string, AgentRunResult>
+      readonly totalTokenUsage: TokenUsage
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Task">
+    Types for discrete units of work tracked by the orchestrator.
+
+    ```typescript
+    /** Valid states for a Task. */
+    type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked'
+    ```
+
+    ```typescript
+    /** A discrete unit of work tracked by the orchestrator. */
+    interface Task {
+      readonly id: string
+      readonly title: string
+      readonly description: string
+      status: TaskStatus
+      /** Agent name responsible for executing this task. */
+      assignee?: string
+      /** IDs of tasks that must complete before this one can start. */
+      dependsOn?: readonly string[]
+      result?: string
+      readonly createdAt: Date
+      updatedAt: Date
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Orchestrator">
+    Types for orchestrator configuration and progress events.
+
+    ```typescript
+    /** Progress event emitted by the orchestrator during a run. */
+    interface OrchestratorEvent {
+      readonly type:
+        | 'agent_start'
+        | 'agent_complete'
+        | 'task_start'
+        | 'task_complete'
+        | 'message'
+        | 'error'
+      readonly agent?: string
+      readonly task?: string
+      readonly data?: unknown
+    }
+    ```
+
+    ```typescript
+    /** Top-level configuration for the orchestrator. */
+    interface OrchestratorConfig {
+      readonly maxConcurrency?: number
+      readonly defaultModel?: string
+      readonly defaultProvider?: 'anthropic' | 'copilot' | 'openai'
+      readonly defaultBaseURL?: string
+      readonly defaultApiKey?: string
+      onProgress?: (event: OrchestratorEvent) => void
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Memory">
+    Types for the key-value memory system shared across agents.
+
+    ```typescript
+    /** A single key-value record stored in a MemoryStore. */
+    interface MemoryEntry {
+      readonly key: string
+      readonly value: string
+      readonly metadata?: Readonly<Record<string, unknown>>
+      readonly createdAt: Date
+    }
+    ```
+
+    ```typescript
+    /**
+     * Persistent (or in-memory) key-value store shared across agents.
+     * Implementations may be backed by Redis, SQLite, or plain objects.
+     */
+    interface MemoryStore {
+      get(key: string): Promise<MemoryEntry | null>
+      set(key: string, value: string, metadata?: Record<string, unknown>): Promise<void>
+      list(): Promise<MemoryEntry[]>
+      delete(key: string): Promise<void>
+      clear(): Promise<void>
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Streaming">
+    Types for streaming LLM responses.
+
+    ```typescript
+    /**
+     * A discrete event emitted during streaming generation.
+     *
+     * - text        — incremental text delta
+     * - tool_use    — the model has begun or completed a tool-use block
+     * - tool_result — a tool result has been appended to the stream
+     * - done        — the stream has ended; data is the final LLMResponse
+     * - error       — an unrecoverable error occurred; data is an Error
+     */
+    interface StreamEvent {
+      readonly type: 'text' | 'tool_use' | 'tool_result' | 'done' | 'error'
+      readonly data: unknown
+    }
+    ```
+
+    Use `stream()` on any `LLMAdapter` to receive `StreamEvent`s:
+
+    ```typescript
+    const adapter: LLMAdapter = createAdapter('anthropic')
+
+    for await (const event of adapter.stream(messages, { model: 'claude-opus-4-6' })) {
+      if (event.type === 'text') process.stdout.write(event.data as string)
+      if (event.type === 'done') console.log('\nDone:', event.data)
+      if (event.type === 'error') throw event.data
+    }
+    ```
+  </Accordion>
+
+</AccordionGroup>
+
+---
+
+## `createAdapter()`
+
+Factory function that returns the appropriate `LLMAdapter` implementation for a given provider. Useful when you need direct access to an LLM adapter outside of the standard agent/team flow.
+
+```typescript
+import { createAdapter } from '@jackchen_me/open-multi-agent'
+import type { SupportedProvider } from '@jackchen_me/open-multi-agent'
+
+async function createAdapter(
+  provider: SupportedProvider,
+  apiKey?: string,
+  baseURL?: string,
+): Promise<LLMAdapter>
+```
+
+```typescript
+type SupportedProvider = 'anthropic' | 'copilot' | 'openai'
+```
+
+<ParamField body="provider" type="SupportedProvider" required>
+  Which LLM provider to target: `'anthropic'`, `'openai'`, or `'copilot'`.
+</ParamField>
+
+<ParamField body="apiKey" type="string">
+  Optional API key override. Falls back to the provider's standard environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`).
+</ParamField>
+
+<ParamField body="baseURL" type="string">
+  Optional base URL for OpenAI-compatible local APIs (Ollama, vLLM, etc.). Only applies to the `'openai'` provider.
+</ParamField>
+
+Adapters are imported lazily so projects using only one provider are not forced to install the SDK for the other.
+
+```typescript
+const adapter = await createAdapter('anthropic')
+const response = await adapter.chat(
+  [{ role: 'user', content: [{ type: 'text', text: 'Hello!' }] }],
+  { model: 'claude-opus-4-6' },
+)
+console.log(response.content)
+```

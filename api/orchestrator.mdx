@@ -1,0 +1,360 @@
+---
+title: "OpenMultiAgent"
+description: "The primary entry point for the open-multi-agent framework. Manages teams, coordinates task execution, and surfaces progress events."
+---
+
+`OpenMultiAgent` ties together every subsystem — teams, task queues, schedulers, agent pools, and individual agents — behind a single, unified API. Most applications interact with this class exclusively.
+
+<Tip>
+  The flagship method is `runTeam()`. It spins up a temporary coordinator agent that automatically decomposes a high-level goal into tasks, assigns them, executes them in dependency order (with parallelism), and synthesises a final answer.
+</Tip>
+
+## Constructor
+
+```typescript
+new OpenMultiAgent(config?: OrchestratorConfig)
+```
+
+<ParamField body="config" type="OrchestratorConfig">
+  Optional top-level configuration. All fields have sensible defaults.
+
+  <Expandable title="OrchestratorConfig fields">
+    <ParamField body="maxConcurrency" type="number" default="5">
+      Maximum number of agent runs allowed in parallel across the entire orchestrator.
+    </ParamField>
+
+    <ParamField body="defaultModel" type="string" default='"claude-opus-4-6"'>
+      LLM model identifier applied to agents that do not specify their own `model`.
+    </ParamField>
+
+    <ParamField body="defaultProvider" type='"anthropic" | "copilot" | "openai"' default='"anthropic"'>
+      LLM provider applied to agents that do not specify their own `provider`.
+    </ParamField>
+
+    <ParamField body="defaultBaseURL" type="string">
+      Custom base URL for OpenAI-compatible local APIs (Ollama, vLLM, LM Studio, etc.). Applied to agents that do not set their own `baseURL`.
+    </ParamField>
+
+    <ParamField body="defaultApiKey" type="string">
+      API key override. Falls back to the provider's standard environment variable when omitted. Applied to agents that do not set their own `apiKey`.
+    </ParamField>
+
+    <ParamField body="onProgress" type="(event: OrchestratorEvent) => void">
+      Callback invoked for every lifecycle event during a run. Receive structured progress without polling.
+
+      <Expandable title="OrchestratorEvent fields">
+        <ResponseField name="type" type='"agent_start" | "agent_complete" | "task_start" | "task_complete" | "message" | "error"' required>
+          The kind of event that occurred.
+        </ResponseField>
+        <ResponseField name="agent" type="string">
+          Name of the agent involved, when applicable.
+        </ResponseField>
+        <ResponseField name="task" type="string">
+          ID of the task involved, when applicable.
+        </ResponseField>
+        <ResponseField name="data" type="unknown">
+          Structured payload specific to the event type (e.g. the `AgentRunResult` on `agent_complete`).
+        </ResponseField>
+      </Expandable>
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Methods
+
+### createTeam
+
+```typescript
+createTeam(name: string, config: TeamConfig): Team
+```
+
+Create and register a `Team` with the orchestrator.
+
+<ParamField path="name" type="string" required>
+  Unique team identifier. Throws if a team with this name is already registered.
+</ParamField>
+
+<ParamField path="config" type="TeamConfig" required>
+  Team configuration — agent roster, shared memory, and concurrency settings. See the [Team](/api/team) reference for full `TeamConfig` fields.
+</ParamField>
+
+Returns the new `Team` instance.
+
+---
+
+### runAgent
+
+```typescript
+runAgent(config: AgentConfig, prompt: string): Promise<AgentRunResult>
+```
+
+Run a single prompt with a one-off, stateless agent. The agent is not registered with any pool or team — useful for simple one-shot queries.
+
+<ParamField path="config" type="AgentConfig" required>
+  Agent configuration. Falls back to orchestrator-level `defaultProvider`, `defaultBaseURL`, and `defaultApiKey` when the corresponding fields are omitted.
+</ParamField>
+
+<ParamField path="prompt" type="string" required>
+  The user prompt to send to the agent.
+</ParamField>
+
+Returns `Promise<AgentRunResult>`. See [AgentRunResult](#agentrunresult) below.
+
+---
+
+### runTeam
+
+```typescript
+runTeam(team: Team, goal: string): Promise<TeamRunResult>
+```
+
+Run a team on a high-level goal with **full automatic orchestration**.
+
+The method works in five phases:
+
+1. A coordinator agent decomposes the goal into a JSON task list.
+2. Tasks are loaded into a dependency-aware queue.
+3. A scheduler assigns unassigned tasks to team agents.
+4. Tasks execute in dependency order; independent tasks run in parallel up to `maxConcurrency`.
+5. The coordinator synthesises a final answer from all task outputs.
+
+<ParamField path="team" type="Team" required>
+  A team created via `createTeam()` or `new Team(config)`.
+</ParamField>
+
+<ParamField path="goal" type="string" required>
+  High-level natural-language goal for the team.
+</ParamField>
+
+Returns `Promise<TeamRunResult>`. See [TeamRunResult](#teamrunresult) below.
+
+<Note>
+  The `coordinator` agent key in `agentResults` holds the synthesised final answer. Access it with `result.agentResults.get('coordinator')?.output`.
+</Note>
+
+---
+
+### runTasks
+
+```typescript
+runTasks(
+  team: Team,
+  tasks: ReadonlyArray<{
+    title: string
+    description: string
+    assignee?: string
+    dependsOn?: string[]
+  }>
+): Promise<TeamRunResult>
+```
+
+Run a team with an **explicitly provided task list**. No coordinator agent is involved — tasks are loaded directly into the queue and executed in dependency order.
+
+<ParamField path="team" type="Team" required>
+  A team created via `createTeam()`.
+</ParamField>
+
+<ParamField path="tasks" type="ReadonlyArray<object>" required>
+  Array of task descriptors.
+
+  <Expandable title="Task descriptor fields">
+    <ParamField body="title" type="string" required>
+      Short descriptive title for the task.
+    </ParamField>
+    <ParamField body="description" type="string" required>
+      Full task description passed to the assigned agent as the prompt body.
+    </ParamField>
+    <ParamField body="assignee" type="string">
+      Name of the agent to run this task. Unassigned tasks are auto-assigned by the scheduler.
+    </ParamField>
+    <ParamField body="dependsOn" type="string[]">
+      Titles or IDs of tasks that must complete before this one starts.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+Returns `Promise<TeamRunResult>`.
+
+---
+
+### getStatus
+
+```typescript
+getStatus(): { teams: number; activeAgents: number; completedTasks: number }
+```
+
+Returns a lightweight snapshot of orchestrator state.
+
+<ResponseField name="teams" type="number" required>
+  Number of teams registered with this orchestrator instance.
+</ResponseField>
+
+<ResponseField name="activeAgents" type="number" required>
+  Number of agents currently in `running` state. Agent pools are ephemeral per-run, so this is `0` between runs.
+</ResponseField>
+
+<ResponseField name="completedTasks" type="number" required>
+  Cumulative count of successfully completed user tasks since the orchestrator was created or last shut down. Coordinator meta-steps are excluded.
+</ResponseField>
+
+---
+
+### shutdown
+
+```typescript
+shutdown(): Promise<void>
+```
+
+Deregister all teams and reset internal counters. Does not cancel in-flight runs. Call this to reuse the orchestrator instance for a fresh set of teams.
+
+## Return types
+
+### AgentRunResult
+
+<ResponseField name="success" type="boolean" required>
+  `true` when the agent completed without throwing.
+</ResponseField>
+
+<ResponseField name="output" type="string" required>
+  The final text output from the last assistant turn.
+</ResponseField>
+
+<ResponseField name="messages" type="LLMMessage[]" required>
+  All messages accumulated during this run (assistant turns and tool results).
+</ResponseField>
+
+<ResponseField name="tokenUsage" type="TokenUsage" required>
+  Aggregated token counts across every LLM call in this run.
+
+  <Expandable title="TokenUsage fields">
+    <ResponseField name="input_tokens" type="number" required>
+      Total input tokens consumed.
+    </ResponseField>
+    <ResponseField name="output_tokens" type="number" required>
+      Total output tokens generated.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="toolCalls" type="ToolCallRecord[]" required>
+  All tool invocations made during this run, in execution order.
+
+  <Expandable title="ToolCallRecord fields">
+    <ResponseField name="toolName" type="string" required>
+      Name of the tool that was called.
+    </ResponseField>
+    <ResponseField name="input" type="Record<string, unknown>" required>
+      The input object passed to the tool.
+    </ResponseField>
+    <ResponseField name="output" type="string" required>
+      Serialised result returned by the tool.
+    </ResponseField>
+    <ResponseField name="duration" type="number" required>
+      Wall-clock execution time in milliseconds.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### TeamRunResult
+
+<ResponseField name="success" type="boolean" required>
+  `true` when every agent task completed without error.
+</ResponseField>
+
+<ResponseField name="agentResults" type="Map<string, AgentRunResult>" required>
+  Results keyed by agent name. When an agent ran multiple tasks, their outputs are merged with `---` separators. The `coordinator` key holds the final synthesised answer when using `runTeam()`.
+</ResponseField>
+
+<ResponseField name="totalTokenUsage" type="TokenUsage" required>
+  Aggregated token usage across all agents and all tasks in the run.
+
+  <Expandable title="TokenUsage fields">
+    <ResponseField name="input_tokens" type="number" required>
+      Total input tokens consumed across the entire team run.
+    </ResponseField>
+    <ResponseField name="output_tokens" type="number" required>
+      Total output tokens generated across the entire team run.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Complete example
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+
+const orchestrator = new OpenMultiAgent({
+  defaultModel: 'claude-opus-4-6',
+  maxConcurrency: 3,
+  onProgress: (event) => {
+    console.log(`[${event.type}] agent=${event.agent ?? '-'} task=${event.task ?? '-'}`)
+  },
+})
+
+// Create a team with two specialised agents
+const team = orchestrator.createTeam('research', {
+  name: 'research',
+  agents: [
+    {
+      name: 'researcher',
+      model: 'claude-opus-4-6',
+      systemPrompt: 'You are a rigorous research assistant. Cite sources.',
+    },
+    {
+      name: 'writer',
+      model: 'claude-opus-4-6',
+      systemPrompt: 'You are a technical writer. Write clear, concise prose.',
+    },
+  ],
+  sharedMemory: true,
+})
+
+// Automatic orchestration — coordinator decomposes the goal
+const result = await orchestrator.runTeam(
+  team,
+  'Produce a 500-word report on the key features of TypeScript 5.5.',
+)
+
+console.log('Success:', result.success)
+console.log('Final report:\n', result.agentResults.get('coordinator')?.output)
+console.log('Total tokens:', result.totalTokenUsage)
+
+// Explicit task list — no coordinator involved
+const explicitResult = await orchestrator.runTasks(team, [
+  {
+    title: 'Research TypeScript 5.5',
+    description: 'List the five most impactful features in TypeScript 5.5 with brief explanations.',
+    assignee: 'researcher',
+  },
+  {
+    title: 'Write the report',
+    description: 'Turn the research notes into a polished 500-word report.',
+    assignee: 'writer',
+    dependsOn: ['Research TypeScript 5.5'],
+  },
+])
+
+console.log('Writer output:\n', explicitResult.agentResults.get('writer')?.output)
+
+// One-shot agent — no team needed
+const quick = await orchestrator.runAgent(
+  { name: 'helper', model: 'claude-opus-4-6' },
+  'What is the difference between `unknown` and `any` in TypeScript?',
+)
+console.log(quick.output)
+
+// Status snapshot
+const status = orchestrator.getStatus()
+console.log(`Teams: ${status.teams}, Completed tasks: ${status.completedTasks}`)
+
+await orchestrator.shutdown()
+```
+
+<CardGroup cols={2}>
+  <Card title="Team" icon="users" href="/api/team">
+    Configure agent rosters, shared memory, and messaging.
+  </Card>
+  <Card title="Agent & AgentPool" icon="robot" href="/api/agent">
+    Low-level agent execution and concurrency primitives.
+  </Card>
+</CardGroup>

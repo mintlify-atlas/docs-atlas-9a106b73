@@ -1,0 +1,413 @@
+---
+title: "Tool Registry"
+description: "Core primitives for declaring, registering, executing, and converting tools to the JSON Schema format that LLM APIs expect."
+---
+
+## Overview
+
+Tools are the mechanism by which agents interact with the outside world. The framework provides three layers:
+
+1. **`defineTool()`** — declare a typed, validated tool.
+2. **`ToolRegistry`** — store and look up tools; convert them to LLM-ready JSON Schema.
+3. **`ToolExecutor`** — run single or batch tool calls with Zod validation and concurrency control.
+
+```typescript
+import { defineTool, ToolRegistry, ToolExecutor } from '@jackchen_me/open-multi-agent'
+import { z } from 'zod'
+
+const echoTool = defineTool({
+  name: 'echo',
+  description: 'Echo the input message back to the caller.',
+  inputSchema: z.object({ message: z.string() }),
+  execute: async ({ message }) => ({ data: message, isError: false }),
+})
+
+const registry = new ToolRegistry()
+registry.register(echoTool)
+
+const executor = new ToolExecutor(registry)
+const result = await executor.execute('echo', { message: 'hello' }, context)
+```
+
+---
+
+## `defineTool()`
+
+Single entry-point for creating tools that can be registered with a `ToolRegistry`. Returns an object satisfying the `ToolDefinition<TInput>` interface.
+
+```typescript
+function defineTool<TInput>(config: {
+  name: string
+  description: string
+  inputSchema: ZodSchema<TInput>
+  execute: (input: TInput, context: ToolUseContext) => Promise<ToolResult>
+}): ToolDefinition<TInput>
+```
+
+<ParamField body="name" type="string" required>
+  Unique tool name used to look it up in the registry and in LLM API tool lists. Must not conflict with other registered tools.
+</ParamField>
+
+<ParamField body="description" type="string" required>
+  Human-readable description sent to the LLM to help it decide when and how to call the tool.
+</ParamField>
+
+<ParamField body="inputSchema" type="ZodSchema<TInput>" required>
+  Zod schema that defines and validates the tool's input. Used both for TypeScript type inference and runtime validation before `execute` is called. Converted to JSON Schema via `zodToJsonSchema()` for the LLM API payload.
+</ParamField>
+
+<ParamField body="execute" type="(input: TInput, context: ToolUseContext) => Promise<ToolResult>" required>
+  Async function that performs the tool's work. Receives the validated, type-safe input and a `ToolUseContext` with agent/team metadata and an abort signal. Must return a `ToolResult`.
+</ParamField>
+
+```typescript
+const searchTool = defineTool({
+  name: 'web_search',
+  description: 'Search the web and return the top results.',
+  inputSchema: z.object({
+    query: z.string().describe('The search query'),
+    maxResults: z.number().optional().default(5),
+  }),
+  execute: async ({ query, maxResults }, context) => {
+    if (context.abortSignal?.aborted) {
+      return { data: 'Search aborted', isError: true }
+    }
+    const results = await fetchSearchResults(query, maxResults)
+    return { data: JSON.stringify(results), isError: false }
+  },
+})
+```
+
+---
+
+## `ToolDefinition<TInput>`
+
+```typescript
+interface ToolDefinition<TInput = Record<string, unknown>> {
+  readonly name: string
+  readonly description: string
+  readonly inputSchema: ZodSchema<TInput>
+  execute(input: TInput, context: ToolUseContext): Promise<ToolResult>
+}
+```
+
+---
+
+## `ToolResult`
+
+```typescript
+interface ToolResult {
+  readonly data: string
+  readonly isError?: boolean
+}
+```
+
+<ResponseField name="data" type="string" required>
+  The tool's output as a string. For structured data, serialise with `JSON.stringify`.
+</ResponseField>
+
+<ResponseField name="isError" type="boolean">
+  When `true`, the LLM is informed that the tool call failed. The `data` field should contain an error message. Defaults to `false`.
+</ResponseField>
+
+---
+
+## `ToolUseContext`
+
+Injected into every tool execution by the agent runner.
+
+```typescript
+interface ToolUseContext {
+  readonly agent: AgentInfo
+  readonly team?: TeamInfo
+  readonly abortSignal?: AbortSignal
+  readonly abortController?: AbortController
+  readonly cwd?: string
+  readonly metadata?: Readonly<Record<string, unknown>>
+}
+```
+
+<ResponseField name="agent" type="AgentInfo" required>
+  Descriptor for the agent invoking the tool: `{ name: string, role: string, model: string }`.
+</ResponseField>
+
+<ResponseField name="team" type="TeamInfo">
+  Team context, present when the tool runs inside a multi-agent team. Includes team name, agent names, and a reference to the shared `MemoryStore`.
+</ResponseField>
+
+<ResponseField name="abortSignal" type="AbortSignal">
+  Convenience reference to the abort signal. Read `abortSignal?.aborted` for simple cancellation checks.
+</ResponseField>
+
+<ResponseField name="abortController" type="AbortController">
+  Full abort controller, available when the tool needs to propagate cancellation to child processes.
+</ResponseField>
+
+<ResponseField name="cwd" type="string">
+  Working directory hint for file-system tools.
+</ResponseField>
+
+<ResponseField name="metadata" type="Record<string, unknown>">
+  Arbitrary caller-supplied metadata such as session ID or request ID.
+</ResponseField>
+
+---
+
+## `ToolRegistry` class
+
+Holds a set of named tools and produces the JSON Schema representation expected by LLM APIs.
+
+### Constructor
+
+```typescript
+new ToolRegistry()
+```
+
+---
+
+### Methods
+
+#### `register(tool)`
+
+```typescript
+register(tool: ToolDefinition<any>): void
+```
+
+Adds a tool to the registry. Throws if a tool with the same name has already been registered — prevents silent overwrites.
+
+---
+
+#### `get(name)`
+
+```typescript
+get(name: string): ToolDefinition<any> | undefined
+```
+
+Returns a tool by name, or `undefined` if not found.
+
+---
+
+#### `list()`
+
+```typescript
+list(): ToolDefinition<any>[]
+```
+
+Returns all registered tool definitions as an array. Equivalent to `getAll()`.
+
+---
+
+#### `getAll()`
+
+```typescript
+getAll(): ToolDefinition<any>[]
+```
+
+Alias for `list()`. Available for callers that prefer explicit naming.
+
+---
+
+#### `has(name)`
+
+```typescript
+has(name: string): boolean
+```
+
+Returns `true` when a tool with the given name is registered.
+
+---
+
+#### `unregister(name)`
+
+```typescript
+unregister(name: string): void
+```
+
+Removes a tool by name. No-op if the tool was not registered.
+
+---
+
+#### `deregister(name)`
+
+```typescript
+deregister(name: string): void
+```
+
+Alias for `unregister()`, provided for symmetry with `register()`.
+
+---
+
+#### `toToolDefs()`
+
+```typescript
+toToolDefs(): LLMToolDef[]
+```
+
+Converts all registered tools to the `LLMToolDef` format used by LLM adapters. This is the primary method called by the agent runner before each LLM API call.
+
+```typescript
+interface LLMToolDef {
+  readonly name: string
+  readonly description: string
+  readonly inputSchema: Record<string, unknown>  // JSON Schema
+}
+```
+
+---
+
+#### `toLLMTools()`
+
+```typescript
+toLLMTools(): Array<{
+  name: string
+  description: string
+  input_schema: {
+    type: 'object'
+    properties: Record<string, JSONSchemaProperty>
+    required?: string[]
+  }
+}>
+```
+
+Converts all registered tools to the Anthropic-style `input_schema` format. Use `toToolDefs()` for normal use; this method is exposed for callers that construct their own API payloads.
+
+---
+
+## `ToolExecutor` class
+
+Executes tools from a `ToolRegistry`, validating input against each tool's Zod schema and enforcing a concurrency limit for batch execution. All errors — unknown tool names, validation failures, and execution exceptions — are caught and returned as `ToolResult` objects with `isError: true`.
+
+### Constructor
+
+```typescript
+new ToolExecutor(registry: ToolRegistry, options?: ToolExecutorOptions)
+```
+
+<ParamField body="registry" type="ToolRegistry" required>
+  The tool registry to look up tools from.
+</ParamField>
+
+<ParamField body="options" type="ToolExecutorOptions">
+  Optional configuration.
+
+  <Expandable title="ToolExecutorOptions">
+    <ParamField body="maxConcurrency" type="number" default="4">
+      Maximum number of tool calls that may run in parallel. Controls a semaphore used by `executeBatch`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+### `execute(toolName, input, context)`
+
+```typescript
+async execute(
+  toolName: string,
+  input: Record<string, unknown>,
+  context: ToolUseContext,
+): Promise<ToolResult>
+```
+
+Executes a single tool by name. The method itself never rejects — errors are returned as `ToolResult` with `isError: true`.
+
+Execution flow:
+1. Look up `toolName` in the registry. Return error result if not found.
+2. Check `context.abortSignal?.aborted`. Return error result if aborted.
+3. Validate `input` with the tool's Zod schema. Return error result on failure.
+4. Call `tool.execute(parsedInput, context)`. Catch any thrown exception and return it as an error result.
+
+---
+
+### `executeBatch(calls, context)`
+
+```typescript
+async executeBatch(
+  calls: BatchToolCall[],
+  context: ToolUseContext,
+): Promise<Map<string, ToolResult>>
+```
+
+Executes multiple tool calls in parallel, honouring the `maxConcurrency` limit. Returns a `Map` from call ID to result. Every call in `calls` is guaranteed to produce an entry.
+
+<ParamField body="calls" type="BatchToolCall[]" required>
+  Array of tool calls to execute.
+
+  <Expandable title="BatchToolCall">
+    <ParamField body="id" type="string" required>
+      Caller-assigned ID used as the key in the result map. Typically the `tool_use_id` from the LLM response.
+    </ParamField>
+    <ParamField body="name" type="string" required>
+      Registered tool name.
+    </ParamField>
+    <ParamField body="input" type="Record<string, unknown>" required>
+      Raw (unparsed) input object from the LLM. The executor validates it with the tool's Zod schema.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="context" type="ToolUseContext" required>
+  Shared execution context forwarded to all tool calls in this batch.
+</ParamField>
+
+```typescript
+const results = await executor.executeBatch(
+  [
+    { id: 'call_1', name: 'web_search', input: { query: 'TypeScript 5.5' } },
+    { id: 'call_2', name: 'read_file', input: { path: './src/index.ts' } },
+  ],
+  context,
+)
+
+for (const [id, result] of results) {
+  if (result.isError) console.error(`${id} failed:`, result.data)
+  else console.log(`${id}:`, result.data)
+}
+```
+
+---
+
+## `zodToJsonSchema()`
+
+Converts a Zod schema to a plain JSON Schema object suitable for inclusion in LLM API calls.
+
+```typescript
+function zodToJsonSchema(schema: ZodSchema): Record<string, unknown>
+```
+
+### Supported Zod types
+
+| Zod type | JSON Schema output |
+|---|---|
+| `z.string()` | `{ type: 'string' }` |
+| `z.number()` | `{ type: 'number' }` |
+| `z.boolean()` | `{ type: 'boolean' }` |
+| `z.bigint()` | `{ type: 'integer' }` |
+| `z.null()` | `{ type: 'null' }` |
+| `z.undefined()` | `{ type: 'null' }` |
+| `z.date()` | `{ type: 'string', format: 'date-time' }` |
+| `z.literal(value)` | `{ const: value }` |
+| `z.enum([...])` | `{ type: 'string', enum: [...] }` |
+| `z.nativeEnum(...)` | `{ enum: [...] }` |
+| `z.array(T)` | `{ type: 'array', items: T }` |
+| `z.tuple([...])` | `{ type: 'array', prefixItems: [...] }` |
+| `z.object({...})` | `{ type: 'object', properties: {...}, required: [...] }` |
+| `z.record(T)` | `{ type: 'object', additionalProperties: T }` |
+| `z.optional(T)` | Unwrapped inner type (field omitted from `required`) |
+| `z.nullable(T)` | `{ anyOf: [T, { type: 'null' }] }` or `{ type: [T, 'null'] }` |
+| `z.default(T, val)` | Inner type with `default` property |
+| `z.union([...])` | `{ anyOf: [...] }` |
+| `z.discriminatedUnion(...)` | `{ anyOf: [...] }` |
+| `z.intersection(A, B)` | `{ allOf: [A, B] }` |
+| `z.any()` / `z.unknown()` | `{}` (JSON Schema wildcard) |
+| `z.never()` | `{ not: {} }` |
+| `z.void()` | `{ type: 'null' }` |
+| `z.effects(T)` (transforms) | Unwrapped inner type |
+| `z.branded(T)` | Unwrapped inner type |
+| `z.readonly(T)` | Unwrapped inner type |
+
+Unsupported types fall back to `{}` which is still valid JSON Schema.
+
+<Note>
+  `.describe('...')` annotations on any Zod type are preserved as the `description` field in the generated JSON Schema, and are shown to the LLM alongside each property.
+</Note>

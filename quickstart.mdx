@@ -1,80 +1,258 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Install Open Multi-Agent and run a 3-agent team that designs, implements, and reviews a REST API — in under 5 minutes."
 ---
 
-## Get started in three steps
+This guide gets you to a working result as fast as possible. You will install the package, configure an API key, and run a real 3-agent team that decomposes a goal automatically.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+- Node.js 18 or higher
+- An Anthropic API key (get one at [console.anthropic.com](https://console.anthropic.com))
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<Steps>
 
-### Step 2: Deploy your changes
+<Step title="Install the package">
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<CodeGroup>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash npm
+npm install @jackchen_me/open-multi-agent
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash yarn
+yarn add @jackchen_me/open-multi-agent
+```
 
-### Step 3: Go live
+```bash pnpm
+pnpm add @jackchen_me/open-multi-agent
+```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+</CodeGroup>
+
+</Step>
+
+<Step title="Set your API key">
+
+<CodeGroup>
+
+```bash Anthropic (required)
+export ANTHROPIC_API_KEY=your-key-here
+```
+
+```bash OpenAI (optional)
+export OPENAI_API_KEY=your-key-here
+```
+
+```bash GitHub Copilot (optional)
+export GITHUB_TOKEN=your-token-here
+```
+
+</CodeGroup>
+
+<Tip>
+  You only need one provider key to get started. Anthropic is the default. See the [providers guide](/guides/providers) for mixing providers in the same team.
+</Tip>
+
+</Step>
+
+<Step title="Define your agents">
+
+Create a file named `team.ts`. Each agent has a name, a model, a system prompt describing its role, and a list of built-in tools it can use.
+
+```typescript team.ts
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+import type { AgentConfig, OrchestratorEvent } from '@jackchen_me/open-multi-agent'
+
+const architect: AgentConfig = {
+  name: 'architect',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: `You are a software architect with deep experience in Node.js and REST API design.
+Your job is to design clear, production-quality API contracts and file/directory structures.
+Output concise plans in markdown — no unnecessary prose.`,
+  tools: ['bash', 'file_write'],
+  maxTurns: 5,
+  temperature: 0.2,
+}
+
+const developer: AgentConfig = {
+  name: 'developer',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: `You are a TypeScript/Node.js developer. You implement what the architect specifies.
+Write clean, runnable code with proper error handling. Use the tools to write files and run tests.`,
+  tools: ['bash', 'file_read', 'file_write', 'file_edit'],
+  maxTurns: 12,
+  temperature: 0.1,
+}
+
+const reviewer: AgentConfig = {
+  name: 'reviewer',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  systemPrompt: `You are a senior code reviewer. Review code for correctness, security, and clarity.
+Provide a structured review with: LGTM items, suggestions, and any blocking issues.
+Read files using the tools before reviewing.`,
+  tools: ['bash', 'file_read', 'grep'],
+  maxTurns: 5,
+  temperature: 0.3,
+}
+```
+
+</Step>
+
+<Step title="Create the orchestrator and team">
+
+```typescript team.ts
+const startTimes = new Map<string, number>()
+
+function handleProgress(event: OrchestratorEvent): void {
+  const ts = new Date().toISOString().slice(11, 23) // HH:MM:SS.mmm
+
+  switch (event.type) {
+    case 'agent_start':
+      startTimes.set(event.agent ?? '', Date.now())
+      console.log(`[${ts}] AGENT START  → ${event.agent}`)
+      break
+    case 'agent_complete': {
+      const elapsed = Date.now() - (startTimes.get(event.agent ?? '') ?? Date.now())
+      console.log(`[${ts}] AGENT DONE   ← ${event.agent} (${elapsed}ms)`)
+      break
+    }
+    case 'task_start':
+      console.log(`[${ts}] TASK START   ↓ ${event.task}`)
+      break
+    case 'task_complete':
+      console.log(`[${ts}] TASK DONE    ↑ ${event.task}`)
+      break
+    case 'error':
+      console.error(`[${ts}] ERROR        ✗ agent=${event.agent} task=${event.task}`)
+      break
+  }
+}
+
+const orchestrator = new OpenMultiAgent({
+  defaultModel: 'claude-sonnet-4-6',
+  maxConcurrency: 1, // run sequentially so output is readable
+  onProgress: handleProgress,
+})
+
+const team = orchestrator.createTeam('api-team', {
+  name: 'api-team',
+  agents: [architect, developer, reviewer],
+  sharedMemory: true,
+})
+```
+
+</Step>
+
+<Step title="Run the team">
+
+Call `runTeam()` with a plain-text goal. The framework handles decomposition, scheduling, and synthesis.
+
+```typescript team.ts
+const goal = `Create a minimal Express.js REST API in /tmp/express-api/ with:
+- GET  /health       → { status: "ok" }
+- GET  /users        → returns a hardcoded array of 2 user objects
+- POST /users        → accepts { name, email } body, logs it, returns 201
+- Proper error handling middleware
+- The server should listen on port 3001
+- Include a package.json with the required dependencies`
+
+const result = await orchestrator.runTeam(team, goal)
+
+console.log(`\nSuccess: ${result.success}`)
+console.log(`Tokens — input: ${result.totalTokenUsage.input_tokens}, output: ${result.totalTokenUsage.output_tokens}`)
+
+for (const [agentName, agentResult] of result.agentResults) {
+  const status = agentResult.success ? 'OK' : 'FAILED'
+  console.log(`  ${agentName.padEnd(12)} [${status}]  tool_calls=${agentResult.toolCalls.length}`)
+}
+```
+
+</Step>
+
+<Step title="Run the script">
+
+```bash
+npx tsx team.ts
+```
+
+</Step>
+
+</Steps>
+
+## What you should see
+
+The `onProgress` callback fires for every state transition. A successful run looks like this:
+
+```text
+[10:21:04.132] AGENT START  → coordinator
+[10:21:11.887] AGENT DONE   ← coordinator (7755ms)
+[10:21:11.890] TASK START   ↓ task-abc123
+[10:21:11.891] AGENT START  → architect
+[10:21:22.410] AGENT DONE   ← architect (10520ms)
+[10:21:22.412] TASK DONE    ↑ task-abc123
+[10:21:22.415] TASK START   ↓ task-def456
+[10:21:22.416] AGENT START  → developer
+[10:21:48.773] AGENT DONE   ← developer (26357ms)
+[10:21:48.775] TASK DONE    ↑ task-def456
+[10:21:48.778] TASK START   ↓ task-ghi789
+[10:21:48.779] AGENT START  → reviewer
+[10:21:58.234] AGENT DONE   ← reviewer (9455ms)
+[10:21:58.236] TASK DONE    ↑ task-ghi789
+[10:21:58.240] AGENT START  → coordinator
+[10:22:06.991] AGENT DONE   ← coordinator (8751ms)
+
+Success: true
+Tokens — input: 31204, output: 12847
+  coordinator  [OK]  tool_calls=0
+  architect    [OK]  tool_calls=3
+  developer    [OK]  tool_calls=11
+  reviewer     [OK]  tool_calls=4
+```
+
+<Note>
+  The coordinator fires twice: once at the start to decompose the goal into tasks, and once at the end to synthesize a final answer from all task outputs.
+</Note>
+
+## Access individual agent results
+
+`result.agentResults` is a `Map<string, AgentRunResult>` keyed by agent name:
+
+```typescript
+// The coordinator's synthesized final answer
+const summary = result.agentResults.get('coordinator')?.output
+console.log(summary)
+
+// The developer's code output
+const developerResult = result.agentResults.get('developer')
+if (developerResult?.success) {
+  console.log(developerResult.output)
+  console.log(`Tool calls: ${developerResult.toolCalls.length}`)
+}
+
+// The reviewer's findings
+const reviewerResult = result.agentResults.get('reviewer')
+if (reviewerResult?.success) {
+  console.log(reviewerResult.output)
+}
+```
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Core concepts" icon="lightbulb" href="/concepts">
+    Understand agents, teams, task DAGs, shared memory, and progress events in depth.
+  </Card>
+  <Card title="Single-agent guide" icon="user" href="/guides/single-agent">
+    Use `runAgent()`, `stream()`, and multi-turn `prompt()` directly.
+  </Card>
+  <Card title="Task pipeline guide" icon="diagram-project" href="/guides/task-pipeline">
+    Skip the coordinator and define your own task graph with `runTasks()`.
+  </Card>
+  <Card title="Providers guide" icon="cube" href="/guides/providers">
+    Use OpenAI, GitHub Copilot, or mix providers in the same team.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

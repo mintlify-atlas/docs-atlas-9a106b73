@@ -1,0 +1,272 @@
+---
+title: "Task Pipeline"
+description: "Define an explicit task graph with dependsOn chains and let the orchestrator enforce dependency ordering and parallel execution."
+---
+
+`runTasks()` gives you complete control over the task graph. You declare every task upfront with an optional `assignee` and a `dependsOn` list of task titles. The `TaskQueue` enforces the dependency order at runtime — downstream tasks block until their dependencies complete.
+
+<CardGroup cols={2}>
+  <Card title="Explicit graph" icon="diagram-project" href="/api/task-queue">
+    You define the tasks and their dependencies. No coordinator agent is involved.
+  </Card>
+  <Card title="Parallel by default" icon="bolt" href="/api/orchestrator">
+    Tasks whose dependencies are all satisfied run concurrently up to `maxConcurrency`.
+  </Card>
+</CardGroup>
+
+<Note>
+  Use `runTasks()` when you already know the step breakdown. Use [`runTeam()`](/guides/team-orchestration) when you want the orchestrator to infer tasks from a natural-language goal.
+</Note>
+
+## Defining agents
+
+Each agent in a pipeline should have a narrow, focused role:
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+import type { AgentConfig, OrchestratorEvent, Task } from 'open-multi-agent/types'
+
+const designer: AgentConfig = {
+  name: 'designer',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: `You are a software designer. Your output is always a concise technical spec
+in markdown. Focus on interfaces, data shapes, and file structure. Be brief.`,
+  tools: ['file_write'],
+  maxTurns: 4,
+}
+
+const implementer: AgentConfig = {
+  name: 'implementer',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: `You are a TypeScript developer. Read the design spec written by the designer,
+then implement it. Write all files to /tmp/pipeline-output/. Use the tools.`,
+  tools: ['bash', 'file_read', 'file_write'],
+  maxTurns: 10,
+}
+
+const tester: AgentConfig = {
+  name: 'tester',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: `You are a QA engineer. Read the implemented files and run them to verify correctness.
+Report: what passed, what failed, and any bugs found.`,
+  tools: ['bash', 'file_read', 'grep'],
+  maxTurns: 6,
+}
+
+const reviewer: AgentConfig = {
+  name: 'reviewer',
+  model: 'claude-sonnet-4-6',
+  systemPrompt: `You are a code reviewer. Read all files and produce a brief structured review.
+Sections: Summary, Strengths, Issues (if any), Verdict (SHIP / NEEDS WORK).`,
+  tools: ['file_read', 'grep'],
+  maxTurns: 4,
+}
+```
+
+## Building the task graph
+
+Each task object specifies a `title`, `description`, an optional `assignee` (agent name), and an optional `dependsOn` array of **task titles**. The framework resolves titles to internal IDs before execution begins.
+
+```typescript
+const SPEC_FILE = '/tmp/pipeline-output/design-spec.md'
+
+const tasks = [
+  {
+    title: 'Design: URL shortener data model',
+    description: `Design a minimal in-memory URL shortener service.
+Write a markdown spec to ${SPEC_FILE} covering:
+- TypeScript interfaces for Url and ShortenRequest
+- The shortening algorithm (hash approach is fine)
+- API contract: POST /shorten, GET /:code
+Keep the spec under 30 lines.`,
+    assignee: 'designer',
+    // no dependsOn — this is the root task
+  },
+  {
+    title: 'Implement: URL shortener',
+    description: `Read the design spec at ${SPEC_FILE}.
+Implement the URL shortener in /tmp/pipeline-output/src/:
+- shortener.ts: core logic (shorten, resolve functions)
+- server.ts: tiny HTTP server using Node's built-in http module (no Express)
+  - POST /shorten  body: { url: string } → { code: string, short: string }
+  - GET  /:code    → redirect (301) or 404
+- index.ts: entry point that starts the server on port 3002
+No external dependencies beyond Node built-ins.`,
+    assignee: 'implementer',
+    dependsOn: ['Design: URL shortener data model'],
+  },
+  {
+    title: 'Test: URL shortener',
+    description: `Run the URL shortener implementation:
+1. Start the server: node /tmp/pipeline-output/src/index.ts (or tsx)
+2. POST a URL to shorten it using curl
+3. Verify the GET redirect works
+4. Report what passed and what (if anything) failed.
+Kill the server after testing.`,
+    assignee: 'tester',
+    dependsOn: ['Implement: URL shortener'],
+  },
+  {
+    title: 'Review: URL shortener',
+    description: `Read all .ts files in /tmp/pipeline-output/src/ and the design spec.
+Produce a structured code review with sections:
+- Summary (2 sentences)
+- Strengths (bullet list)
+- Issues (bullet list, or "None" if clean)
+- Verdict: SHIP or NEEDS WORK`,
+    assignee: 'reviewer',
+    dependsOn: ['Implement: URL shortener'], // runs in parallel with Test after Implement completes
+  },
+]
+```
+
+This graph encodes a four-stage pipeline:
+
+```
+design  →  implement  →  test    (parallel after implement)
+                     →  review   (parallel after implement)
+```
+
+## Running the pipeline
+
+Create the orchestrator, register agents in a team, and call `runTasks()`:
+
+```typescript
+const orchestrator = new OpenMultiAgent({
+  defaultModel: 'claude-sonnet-4-6',
+  maxConcurrency: 2, // allow test + review to run in parallel
+  onProgress: handleProgress,
+})
+
+const team = orchestrator.createTeam('pipeline-team', {
+  name: 'pipeline-team',
+  agents: [designer, implementer, tester, reviewer],
+  sharedMemory: true,
+})
+
+console.log('Starting 4-stage task pipeline...\n')
+console.log('Pipeline: design → implement → test + review (parallel)')
+console.log('='.repeat(60))
+
+const result = await orchestrator.runTasks(team, tasks)
+```
+
+## Tracking dependency ordering with `onProgress`
+
+The progress handler shows exactly when tasks unblock:
+
+```typescript
+const taskTimes = new Map<string, number>()
+
+function handleProgress(event: OrchestratorEvent): void {
+  const ts = new Date().toISOString().slice(11, 23)
+
+  switch (event.type) {
+    case 'task_start': {
+      taskTimes.set(event.task ?? '', Date.now())
+      const task = event.data as Task | undefined
+      console.log(`[${ts}] TASK READY    "${task?.title ?? event.task}" (assignee: ${task?.assignee ?? 'any'})`)
+      break
+    }
+    case 'task_complete': {
+      const elapsed = Date.now() - (taskTimes.get(event.task ?? '') ?? Date.now())
+      const task = event.data as Task | undefined
+      console.log(`[${ts}] TASK DONE     "${task?.title ?? event.task}" in ${elapsed}ms`)
+      break
+    }
+    case 'agent_start':
+      console.log(`[${ts}] AGENT START   ${event.agent}`)
+      break
+    case 'agent_complete':
+      console.log(`[${ts}] AGENT DONE    ${event.agent}`)
+      break
+    case 'error': {
+      const task = event.data as Task | undefined
+      console.error(`[${ts}] ERROR         ${event.agent ?? ''}  task="${task?.title ?? event.task}"`)
+      break
+    }
+  }
+}
+```
+
+## Reading the results
+
+`runTasks()` returns the same `TeamRunResult` shape as `runTeam()`:
+
+```typescript
+console.log(`Overall success: ${result.success}`)
+console.log(
+  `Tokens — input: ${result.totalTokenUsage.input_tokens}, output: ${result.totalTokenUsage.output_tokens}`,
+)
+
+console.log('\nPer-agent summary:')
+for (const [name, r] of result.agentResults) {
+  const icon = r.success ? 'OK  ' : 'FAIL'
+  const toolCount = r.toolCalls.map(c => c.toolName).join(', ')
+  console.log(`  [${icon}] ${name.padEnd(14)}  tools used: ${toolCount || '(none)'}`)
+}
+
+// Print the reviewer's verdict
+const review = result.agentResults.get('reviewer')
+if (review?.success) {
+  console.log('\nCode review:')
+  console.log('─'.repeat(60))
+  console.log(review.output)
+  console.log('─'.repeat(60))
+}
+```
+
+## Key concepts
+
+<AccordionGroup>
+  <Accordion title="dependsOn uses task titles, not IDs">
+    Reference tasks by their `title` string in `dependsOn`. The framework resolves these to internal UUIDs before the run starts, so you don't need to manage IDs manually.
+
+    ```typescript
+    dependsOn: ['Design: URL shortener data model']
+    ```
+  </Accordion>
+  <Accordion title="Parallel execution after a shared dependency">
+    Two tasks with the same `dependsOn` entry both unblock as soon as that dependency completes. In the example above, `Test` and `Review` both depend on `Implement` and run concurrently once implementation finishes — limited only by `maxConcurrency`.
+  </Accordion>
+  <Accordion title="Failure cascade">
+    When a task fails, all tasks that directly or transitively depend on it are marked `blocked` and skipped. The run's `success` field reflects this — it is `false` if any task failed or was blocked. Inspect `result.agentResults` to identify which tasks were affected.
+  </Accordion>
+  <Accordion title="Unassigned tasks">
+    If `assignee` is omitted, the scheduler auto-assigns the task to the next available agent based on capacity. For deterministic pipelines, always set `assignee` explicitly.
+  </Accordion>
+  <Accordion title="Task status values">
+    Each `Task` object tracks a `status` field throughout the run:
+
+    | Status        | Meaning                                                |
+    | ------------- | ------------------------------------------------------ |
+    | `pending`     | Waiting for dependencies to complete.                  |
+    | `in_progress` | Assigned to an agent and currently executing.          |
+    | `completed`   | Finished successfully. `result` field is populated.    |
+    | `failed`      | The agent returned an error or exceeded `maxTurns`.    |
+    | `blocked`     | A dependency failed; this task will not run.           |
+  </Accordion>
+</AccordionGroup>
+
+## Running the full example
+
+```bash
+ANTHROPIC_API_KEY=your_key npx tsx examples/03-task-pipeline.ts
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Team Orchestration" icon="users" href="/guides/team-orchestration">
+    Let the orchestrator infer tasks automatically from a goal.
+  </Card>
+  <Card title="Fan-Out / Aggregate" icon="git-fork" href="/guides/fan-out-aggregate">
+    Run the same prompt across N agents in parallel, then merge results.
+  </Card>
+  <Card title="API: Task Queue" icon="code" href="/api/task-queue">
+    Full reference for TaskQueue and the Task type.
+  </Card>
+  <Card title="API: Types" icon="file-code" href="/api/types">
+    Complete type definitions including Task, TaskStatus, and TeamRunResult.
+  </Card>
+</CardGroup>

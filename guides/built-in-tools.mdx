@@ -1,0 +1,229 @@
+---
+title: "Built-in Tools"
+description: "Five production-ready tools included with Open Multi-Agent"
+---
+
+Open Multi-Agent ships five tools that cover the most common agent tasks: running shell commands, reading and writing files, making targeted edits, and searching code. They are ready to use without any configuration.
+
+## The five built-in tools
+
+<CardGroup cols={2}>
+  <Card title="bash" icon="terminal">
+    Execute any shell command and capture its stdout and stderr.
+  </Card>
+  <Card title="file_read" icon="file">
+    Read file contents with optional line-range slicing.
+  </Card>
+  <Card title="file_write" icon="pen">
+    Create or overwrite a file; parent directories are created automatically.
+  </Card>
+  <Card title="file_edit" icon="pencil">
+    Replace an exact string inside an existing file.
+  </Card>
+  <Card title="grep" icon="magnifying-glass">
+    Search files by regex; uses ripgrep when available, Node.js fallback otherwise.
+  </Card>
+</CardGroup>
+
+---
+
+## Tool reference
+
+### bash
+
+Execute a bash command and return its stdout and stderr. The command runs in a non-interactive shell (`bash -c`). Use the `timeout` parameter for long-running commands.
+
+```typescript
+inputSchema: z.object({
+  command: z.string(),          // required — the bash command to execute
+  timeout: z.number().optional(), // milliseconds; defaults to 30 000
+  cwd: z.string().optional(),   // working directory for the command
+})
+```
+
+**Return value:** Combined stdout and stderr as a single string. When stderr is also present it is appended under a `--- stderr ---` header. `isError` is `true` when the exit code is non-zero.
+
+```typescript
+// Example agent turn
+// agent calls: bash({ command: "npm test", cwd: "/app", timeout: 60000 })
+// returns:    { data: "✓ 42 tests passed\n", isError: false }
+```
+
+---
+
+### file_read
+
+Read the contents of a file from disk. Returns the file contents with **1-based line numbers** prefixed in the format `N\t<line>`. Use `offset` and `limit` to read large files in chunks without loading the entire file into the context window.
+
+```typescript
+inputSchema: z.object({
+  path: z.string(),              // required — absolute path to the file
+  offset: z.number().int().nonnegative().optional(), // 1-based start line
+  limit: z.number().int().positive().optional(),     // max lines to return
+})
+```
+
+**Return value:** Line-numbered content. When a slice is returned, a footer notes the range, e.g. `(showing lines 1–50 of 312)`.
+
+```typescript
+// Read the first 50 lines of a file
+// file_read({ path: "/app/src/index.ts", offset: 1, limit: 50 })
+```
+
+---
+
+### file_write
+
+Write content to a file, creating it (and any missing parent directories) if it does not already exist, or overwriting it if it does. Prefer this tool for new files; use `file_edit` for targeted in-place edits of existing files.
+
+```typescript
+inputSchema: z.object({
+  path: z.string(),    // required — absolute path; must start with /
+  content: z.string(), // required — full UTF-8 content to write
+})
+```
+
+**Return value:** A summary string like `Created "/app/src/utils.ts" (12 lines, 340 bytes).` or `Updated "..."`.
+
+<Note>
+  Parent directories are created with `mkdir -p` semantics. You do not need to create them beforehand.
+</Note>
+
+---
+
+### file_edit
+
+Edit a file by replacing a specific string with new content. `old_string` must appear verbatim in the file. By default the tool errors if `old_string` appears more than once — use `replace_all: true` to replace every occurrence.
+
+```typescript
+inputSchema: z.object({
+  path: z.string(),       // required — absolute path to the file
+  old_string: z.string(), // required — exact string to find (including whitespace)
+  new_string: z.string(), // required — replacement string
+  replace_all: z.boolean().optional(), // default false
+})
+```
+
+**Return value:** `Replaced 1 occurrence in "/app/src/config.ts".`
+
+<Tip>
+  Make `old_string` as specific as possible — include surrounding lines if needed — to avoid ambiguous matches.
+</Tip>
+
+---
+
+### grep
+
+Search for a regular-expression pattern in one or more files. Returns matching lines with their file paths and 1-based line numbers. Uses the `rg` (ripgrep) binary when available; falls back to a pure Node.js recursive implementation automatically.
+
+```typescript
+inputSchema: z.object({
+  pattern: z.string(),               // required — regex pattern
+  path: z.string().optional(),       // directory or file; defaults to cwd
+  glob: z.string().optional(),       // file filter, e.g. "*.ts" or "**/*.json"
+  maxResults: z.number().int().positive().optional(), // default 100
+})
+```
+
+**Return value:** Matches in `file:line:text` format, one per line. Returns `No matches found.` when there are none. Results are capped at `maxResults`.
+
+```typescript
+// Find all TODO comments in TypeScript files
+// grep({ pattern: "TODO", path: "/app/src", glob: "*.ts" })
+// returns:
+// src/auth.ts:12:  // TODO: add refresh-token support
+// src/routes.ts:88:  // TODO: rate-limit this endpoint
+```
+
+---
+
+## Assigning tools to an agent
+
+Tools are referenced by **name** in the `tools` array of `AgentConfig`. The agent will only be able to call the tools listed there.
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+
+const result = await new OpenMultiAgent().runAgent(
+  {
+    name: 'coder',
+    model: 'claude-sonnet-4-6',
+    provider: 'anthropic',
+    systemPrompt: 'You are a coding assistant.',
+    tools: ['bash', 'file_read', 'file_write', 'file_edit', 'grep'],
+  },
+  'Refactor the auth module to use async/await throughout.',
+)
+```
+
+<Note>
+  When you use the `OpenMultiAgent` high-level API (`runAgent`, `runTeam`, `runTasks`), the five built-in tools are registered automatically. You only need to list the names you want each agent to have access to.
+</Note>
+
+---
+
+## Using `registerBuiltInTools()` with a custom registry
+
+When constructing agents manually — for example to add your own custom tools alongside the built-ins — create a `ToolRegistry`, register the built-ins with `registerBuiltInTools()`, and pass the registry to the `Agent` constructor.
+
+```typescript
+import {
+  Agent,
+  ToolRegistry,
+  ToolExecutor,
+  registerBuiltInTools,
+} from '@jackchen_me/open-multi-agent'
+import type { AgentConfig } from '@jackchen_me/open-multi-agent'
+
+const config: AgentConfig = {
+  name: 'file-agent',
+  model: 'claude-sonnet-4-6',
+  provider: 'anthropic',
+  tools: ['bash', 'file_read', 'file_write'],
+}
+
+const registry = new ToolRegistry()
+registerBuiltInTools(registry)           // adds all five built-in tools
+
+const executor = new ToolExecutor(registry)
+const agent = new Agent(config, registry, executor)
+
+const result = await agent.run('List all TypeScript files under /app/src.')
+```
+
+---
+
+## `BUILT_IN_TOOLS` constant
+
+`BUILT_IN_TOOLS` is an ordered array of all five `ToolDefinition` objects. Use it when you need to iterate over them without calling `registerBuiltInTools`, for example to inspect names or add a subset to a registry manually.
+
+```typescript
+import { BUILT_IN_TOOLS, ToolRegistry } from '@jackchen_me/open-multi-agent'
+
+const registry = new ToolRegistry()
+
+// Register only the read-only tools
+for (const tool of BUILT_IN_TOOLS) {
+  if (['file_read', 'grep'].includes(tool.name)) {
+    registry.register(tool)
+  }
+}
+
+console.log(registry.list().map((t) => t.name))
+// ['file_read', 'grep']
+```
+
+The array is exported in declaration order: `bash`, `file_read`, `file_write`, `file_edit`, `grep`.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Custom Tools" icon="wrench" href="/guides/custom-tools">
+    Define your own tools with Zod schemas and register them alongside the built-ins.
+  </Card>
+  <Card title="Tool Registry API" icon="database" href="/api/tool-registry">
+    Full reference for `ToolRegistry`, `ToolExecutor`, and related types.
+  </Card>
+</CardGroup>

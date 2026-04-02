@@ -1,0 +1,177 @@
+---
+title: "Introduction"
+description: "Open Multi-Agent is a lightweight TypeScript framework for building AI agent teams that automatically decompose goals into parallel task DAGs."
+---
+
+Open Multi-Agent lets you describe a goal in plain text and run a team of specialized agents to accomplish it — without writing any scheduling, dependency resolution, or orchestration code yourself. One `runTeam()` call takes you from goal to result.
+
+3 runtime dependencies. 27 source files.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install and run your first agent team in under 5 minutes.
+  </Card>
+  <Card title="Concepts" icon="lightbulb" href="/concepts">
+    Understand agents, teams, task DAGs, and the coordinator pattern.
+  </Card>
+  <Card title="Single-agent guide" icon="user" href="/guides/single-agent">
+    One agent, one prompt — the simplest entry point.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/orchestrator">
+    Full reference for `OpenMultiAgent`, `Team`, `Agent`, and all exports.
+  </Card>
+</CardGroup>
+
+## What problem does it solve?
+
+Building multi-agent workflows by hand means writing the same boilerplate every time: parse the goal, decide which agents run first, handle dependencies, collect results, synthesize a final answer. This is error-prone and hard to change when requirements shift.
+
+Open Multi-Agent replaces that boilerplate with a **coordinator pattern**: a built-in coordinator agent receives your high-level goal, breaks it into a typed task DAG with explicit dependencies and assignees, and hands it to the scheduler. Independent tasks run in parallel automatically. You get structured progress events and a typed result — no polling, no custom queues.
+
+```
+Goal: "Create a REST API for a todo list in /tmp/todo-api/"
+                          │
+               ┌──────────▼──────────┐
+               │   coordinator       │  ← decomposes into task DAG
+               └──────────┬──────────┘
+                 ┌─────────┴──────────┐
+         ┌───────▼──────┐    ┌────────▼───────┐
+         │  architect   │    │  developer (2) │  ← independent, run in parallel
+         └───────┬──────┘    └────────┬───────┘
+                 └─────────┬──────────┘
+               ┌──────────▼──────────┐
+               │    reviewer         │  ← unblocked after implementation
+               └──────────┬──────────┘
+               ┌──────────▼──────────┐
+               │   coordinator       │  ← synthesizes final answer
+               └─────────────────────┘
+```
+
+## Architecture overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  OpenMultiAgent (Orchestrator)                                  │
+│                                                                 │
+│  createTeam()  runTeam()  runTasks()  runAgent()  getStatus()   │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+            ┌──────────▼──────────┐
+            │  Team               │
+            │  - AgentConfig[]    │
+            │  - MessageBus       │
+            │  - TaskQueue        │
+            │  - SharedMemory     │
+            └──────────┬──────────┘
+                       │
+         ┌─────────────┴─────────────┐
+         │                           │
+┌────────▼──────────┐    ┌───────────▼───────────┐
+│  AgentPool        │    │  TaskQueue             │
+│  - Semaphore      │    │  - dependency graph    │
+│  - runParallel()  │    │  - auto unblock        │
+└────────┬──────────┘    │  - cascade failure     │
+         │               └───────────────────────┘
+┌────────▼──────────┐
+│  Agent            │
+│  - run()          │    ┌──────────────────────┐
+│  - prompt()       │───►│  LLMAdapter          │
+│  - stream()       │    │  - AnthropicAdapter  │
+└────────┬──────────┘    │  - OpenAIAdapter     │
+         │               │  - CopilotAdapter    │
+         │               └──────────────────────┘
+┌────────▼──────────┐
+│  AgentRunner      │    ┌──────────────────────┐
+│  - conversation   │───►│  ToolRegistry        │
+│    loop           │    │  - defineTool()      │
+│  - tool dispatch  │    │  - 5 built-in tools  │
+└───────────────────┘    └──────────────────────┘
+```
+
+Four subsystems collaborate on every run:
+
+- **Coordinator** — A temporary agent that decomposes goals into a JSON task list and synthesizes the final answer.
+- **TaskQueue / task DAG** — Holds tasks with typed statuses and dependency edges. Automatically unblocks tasks when their dependencies complete.
+- **AgentPool** — A semaphore-limited pool that runs agents concurrently up to `maxConcurrency` (default: 5).
+- **SharedMemory** — A key-value store that persists each task's result so later agents can read prior work.
+
+## The three run modes
+
+| Mode | Method | When to use |
+|------|--------|-------------|
+| Single agent | `runAgent(config, prompt)` | One agent, one prompt — simplest entry point for quick tasks |
+| Auto-orchestrated team | `runTeam(team, goal)` | Describe a goal; the framework plans, schedules, and executes |
+| Explicit pipeline | `runTasks(team, tasks)` | You define the task graph and assignments, framework executes |
+
+<CardGroup cols={3}>
+  <Card title="runAgent()" icon="user" href="/guides/single-agent">
+    Constructs a fresh agent, runs your prompt, returns `AgentRunResult`. No team or pool involved.
+  </Card>
+  <Card title="runTeam()" icon="users" href="/guides/team-orchestration">
+    The flagship method. Coordinator decomposes goal → tasks run in parallel → coordinator synthesizes.
+  </Card>
+  <Card title="runTasks()" icon="diagram-project" href="/guides/task-pipeline">
+    Skip the coordinator. You supply the task array with explicit `dependsOn` and `assignee` fields.
+  </Card>
+</CardGroup>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Auto task decomposition" icon="wand-magic-sparkles">
+    Describe a goal in natural language. The coordinator agent produces a JSON task DAG with dependencies and assignees. No manual orchestration needed.
+  </Card>
+  <Card title="Parallel-by-default execution" icon="bolt">
+    Independent tasks (no shared dependency edge) run concurrently up to `maxConcurrency`. Dependent tasks wait automatically.
+  </Card>
+  <Card title="Shared memory between agents" icon="database">
+    Every completed task writes its output to a shared `MemoryStore`. Subsequent agents read prior results via the `task:{id}:result` key pattern.
+  </Card>
+  <Card title="Model agnostic" icon="cube">
+    Claude, GPT, GitHub Copilot, and local models (Ollama, vLLM, LM Studio) in the same team. Set `baseURL` per agent to target any OpenAI-compatible endpoint.
+  </Card>
+  <Card title="Typed progress events" icon="bell">
+    Subscribe to `onProgress` for structured `OrchestratorEvent` objects: `agent_start`, `task_complete`, `error`, and more — no polling required.
+  </Card>
+  <Card title="In-process execution" icon="server">
+    No subprocesses. Everything runs in a single Node.js process. Deploy to serverless, Docker, or CI/CD without additional infrastructure.
+  </Card>
+</CardGroup>
+
+## Supported providers
+
+| Provider | `provider` value | Env var | Status |
+|----------|-----------------|---------|--------|
+| Anthropic (Claude) | `'anthropic'` | `ANTHROPIC_API_KEY` | Verified |
+| OpenAI (GPT) | `'openai'` | `OPENAI_API_KEY` | Verified |
+| GitHub Copilot | `'copilot'` | `GITHUB_TOKEN` | Verified |
+| Ollama / vLLM / LM Studio | `'openai'` + `baseURL` | — | Verified |
+
+<Note>
+  Any OpenAI-compatible API works via `provider: 'openai'` and `baseURL`. DeepSeek, Groq, Mistral, Qwen, and others have not been fully verified — contributions welcome via [#25](https://github.com/JackChen-me/open-multi-agent/issues/25).
+</Note>
+
+## Built-in tools
+
+Five production-ready tools are registered automatically for every agent that lists them:
+
+| Tool | Description |
+|------|-------------|
+| `bash` | Execute shell commands. Returns stdout and stderr. Supports timeout and working directory. |
+| `file_read` | Read file contents at an absolute path. Supports `offset` and `limit` for large files. |
+| `file_write` | Write or create a file. Auto-creates parent directories. |
+| `file_edit` | Edit a file by replacing an exact string match. |
+| `grep` | Search file contents with regex. Uses ripgrep when available, falls back to Node.js. |
+
+You can define additional tools with `defineTool()` and a Zod schema. See the [custom tools guide](/guides/custom-tools).
+
+## vs. manual orchestration
+
+| Capability | Manual orchestration | Open Multi-Agent |
+|-----------|---------------------|-----------------|
+| Task decomposition | You write it | Coordinator agent generates it |
+| Dependency resolution | You topologically sort | `TaskQueue` handles it |
+| Parallel execution | You manage `Promise.all` | `AgentPool` + semaphore |
+| Shared context | You pass results by hand | `SharedMemory` auto-injects |
+| Progress visibility | You instrument everything | Built-in `OrchestratorEvent` stream |
+| Model switching | Different SDK per provider | `provider` + `baseURL` per agent |

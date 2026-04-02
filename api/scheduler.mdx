@@ -1,0 +1,164 @@
+---
+title: "Scheduler"
+description: "Maps pending tasks to available agents using one of four configurable strategies: round-robin, least-busy, capability-match, and dependency-first."
+---
+
+## Overview
+
+`Scheduler` is stateless between calls. All mutable task state lives in the `TaskQueue` that is passed to `autoAssign`. You construct a `Scheduler` once with a chosen strategy and call it whenever new tasks arrive or agents become available.
+
+```typescript
+import { Scheduler } from '@jackchen_me/open-multi-agent'
+
+const scheduler = new Scheduler('capability-match')
+
+// Directly update a live TaskQueue
+scheduler.autoAssign(queue, teamAgents)
+
+// Or get a full assignment map without mutating anything
+const assignments = scheduler.schedule(queue.list(), teamAgents)
+// Map<taskId, agentName>
+```
+
+---
+
+## `SchedulingStrategy`
+
+```typescript
+type SchedulingStrategy =
+  | 'round-robin'
+  | 'least-busy'
+  | 'capability-match'
+  | 'dependency-first'
+```
+
+<AccordionGroup>
+  <Accordion title="round-robin">
+    Distributes tasks evenly across agents by cycling through the agent list in order. An internal cursor advances with each call so repeated invocations continue distributing work rather than always starting from the first agent.
+
+    Best for homogeneous workloads where every agent is equally capable.
+  </Accordion>
+
+  <Accordion title="least-busy">
+    Assigns each task to the agent with the fewest `in_progress` tasks at the time the schedule is computed. Agent load is read from the current task queue snapshot. Ties are broken by the agent's position in the array (earlier is preferred).
+
+    Simulates load as tasks are assigned within a batch, so a single agent is not flooded even when many tasks arrive simultaneously.
+
+    Best for heterogeneous workloads where task duration varies significantly.
+  </Accordion>
+
+  <Accordion title="capability-match">
+    Scores each agent against each task by keyword overlap between the task's `title`/`description` and the agent's `name`, `systemPrompt`, and `model`. The highest-scoring agent wins. Falls back to round-robin order when no agent has any positive score.
+
+    Keywords are normalised to lower-case and common stop-words are stripped before comparison.
+
+    Best for teams with specialised agents (e.g. a `researcher` agent, a `coder` agent, a `writer` agent).
+  </Accordion>
+
+  <Accordion title="dependency-first">
+    Prioritises tasks by how many other tasks are blocked waiting for them (the "critical path" heuristic). Tasks with more downstream dependents are assigned to agents first. Within the same criticality tier, agents are selected round-robin.
+
+    **This is the default strategy** and the safest choice for complex multi-step pipelines because it minimises the time tasks spend blocked.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `Scheduler` class
+
+### Constructor
+
+```typescript
+new Scheduler(strategy?: SchedulingStrategy)
+```
+
+<ParamField body="strategy" type="SchedulingStrategy" default="'dependency-first'">
+  The scheduling algorithm to apply. Defaults to `'dependency-first'`.
+</ParamField>
+
+---
+
+### `schedule(tasks, agents)`
+
+```typescript
+schedule(tasks: Task[], agents: AgentConfig[]): Map<string, string>
+```
+
+Given a snapshot of all tasks and the available agents, returns a `Map<taskId, agentName>` representing the recommended assignment for every unassigned pending task.
+
+Only tasks with `status === 'pending'` and no existing `assignee` are considered. Tasks that are already assigned are left untouched. Returns an empty map when `agents` is empty.
+
+<ParamField body="tasks" type="Task[]" required>
+  Full snapshot of all tasks in the current run (any status). Strategies that consider load or dependencies need the complete list, not just the pending subset.
+</ParamField>
+
+<ParamField body="agents" type="AgentConfig[]" required>
+  Available agent configurations.
+</ParamField>
+
+```typescript
+const assignments = scheduler.schedule(queue.list(), teamAgents)
+for (const [taskId, agentName] of assignments) {
+  console.log(`Assign task ${taskId} to ${agentName}`)
+}
+```
+
+<Note>
+  `round-robin` advances an internal cursor and therefore produces different results across successive calls with the same inputs. All other strategies are deterministic given the same queue snapshot.
+</Note>
+
+---
+
+### `autoAssign(queue, agents)`
+
+```typescript
+autoAssign(queue: TaskQueue, agents: AgentConfig[]): void
+```
+
+Convenience method that calls `schedule()` and applies the resulting assignments directly to the live `TaskQueue` by calling `queue.update(taskId, { assignee: agentName })` for each pair.
+
+Skips tasks that are already assigned, non-pending, or whose IDs are not found in the queue snapshot (e.g. a task completed between the snapshot and the update).
+
+<ParamField body="queue" type="TaskQueue" required>
+  The live task queue to mutate.
+</ParamField>
+
+<ParamField body="agents" type="AgentConfig[]" required>
+  Available agent configurations.
+</ParamField>
+
+```typescript
+// Assign all unassigned pending tasks before starting the run
+scheduler.autoAssign(queue, team.agents)
+
+// Re-run after a task completes to assign newly-unblocked tasks
+queue.on('task:ready', () => {
+  scheduler.autoAssign(queue, team.agents)
+})
+```
+
+---
+
+## How `autoAssign` works
+
+1. Calls `queue.list()` to get a full snapshot of all tasks.
+2. Filters to `'pending'` tasks without an existing `assignee`.
+3. Applies the configured strategy to produce a `Map<taskId, agentName>`.
+4. For each pair, calls `queue.update(taskId, { assignee: agentName })`.
+
+Because the scheduler is stateless beyond the `round-robin` cursor, it is safe to call `autoAssign` multiple times — e.g. on every `'task:ready'` event — without risk of double-assignment. Tasks already assigned are filtered out before the strategy runs.
+
+---
+
+## Strategy comparison
+
+| Strategy | Respects dependencies | Load-aware | Capability-aware | Deterministic |
+|---|---|---|---|---|
+| `round-robin` | No | No | No | No (cursor) |
+| `least-busy` | No | Yes | No | Yes |
+| `capability-match` | No | No | Yes | Yes |
+| `dependency-first` | Yes | No | No | No (cursor) |
+
+<Note>
+  Combine strategies by running `autoAssign` with `'capability-match'` first to give tasks their preferred agent, then `'dependency-first'` to handle any tasks that were not matched.
+</Note>

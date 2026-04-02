@@ -1,0 +1,125 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Open Multi-Agent",
+  "projectDescription": "A lightweight TypeScript framework for building AI agent teams that automatically decompose goals into parallel task graphs, supporting Claude, GPT, and local models.",
+  "theme": "luma",
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "concepts"
+            ]
+          },
+          {
+            "group": "Core Usage",
+            "pages": [
+              "guides/single-agent",
+              "guides/team-orchestration",
+              "guides/task-pipeline",
+              "guides/fan-out-aggregate"
+            ]
+          },
+          {
+            "group": "Tools",
+            "pages": [
+              "guides/built-in-tools",
+              "guides/custom-tools"
+            ]
+          },
+          {
+            "group": "Models & Providers",
+            "pages": [
+              "guides/providers",
+              "guides/local-models"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Orchestrator",
+            "pages": [
+              "api/orchestrator",
+              "api/team",
+              "api/agent"
+            ]
+          },
+          {
+            "group": "Tasks & Scheduling",
+            "pages": [
+              "api/task-queue",
+              "api/scheduler"
+            ]
+          },
+          {
+            "group": "Tools & Memory",
+            "pages": [
+              "api/tool-registry",
+              "api/memory"
+            ]
+          },
+          {
+            "group": "Types",
+            "pages": [
+              "api/types"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Auto task decomposition — describe a goal in plain text and the framework plans the task DAG automatically",
+    "Parallel task execution with dependency-aware scheduling (topological sort)",
+    "Model-agnostic — Claude, GPT, GitHub Copilot, Ollama, vLLM, LM Studio in the same team",
+    "Three run modes: runAgent() for one-shot, runTeam() for auto-orchestration, runTasks() for explicit pipelines",
+    "Coordinator pattern — built-in coordinator agent decomposes goals and synthesises final results",
+    "Shared memory — agents read each other's outputs via a key-value MemoryStore",
+    "Inter-agent messaging via MessageBus",
+    "Concurrency control with AgentPool and Semaphore",
+    "5 built-in tools: bash, file_read, file_write, file_edit, grep",
+    "Custom tools via defineTool() with Zod schema validation"
+  ],
+  "publicApiSurface": [
+    "OpenMultiAgent",
+    "OpenMultiAgent.createTeam()",
+    "OpenMultiAgent.runAgent()",
+    "OpenMultiAgent.runTeam()",
+    "OpenMultiAgent.runTasks()",
+    "OpenMultiAgent.getStatus()",
+    "OpenMultiAgent.shutdown()",
+    "Agent",
+    "AgentPool",
+    "Semaphore",
+    "Team",
+    "MessageBus",
+    "TaskQueue",
+    "Scheduler",
+    "defineTool()",
+    "ToolRegistry",
+    "ToolExecutor",
+    "createTask()",
+    "createAdapter()",
+    "InMemoryStore",
+    "SharedMemory",
+    "registerBuiltInTools()",
+    "BUILT_IN_TOOLS",
+    "bashTool",
+    "fileReadTool",
+    "fileWriteTool",
+    "fileEditTool",
+    "grepTool",
+    "zodToJsonSchema()"
+  ]
+}

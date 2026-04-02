@@ -1,97 +1,92 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Open Multi-Agent"
+description: "A lightweight TypeScript framework for building AI agent teams that automatically decompose goals into parallel task graphs."
 ---
 
-## Setting up
+Build AI agent teams that decompose goals into tasks automatically. Define agents with roles and tools, describe a goal — the framework plans the task graph, schedules dependencies, and runs everything in parallel.
 
-Get your documentation site up and running in minutes.
+3 runtime dependencies. One `runTeam()` call from goal to result.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install the package and run your first agent team in under 5 minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Core Concepts" icon="lightbulb" href="/concepts">
+    Understand agents, teams, task DAGs, and the coordinator pattern.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="API Reference" icon="code" href="/api/orchestrator">
+    Full reference for OpenMultiAgent, Team, Agent, and all public exports.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Examples" icon="book-open" href="/guides/team-orchestration">
+    Real-world examples from single agents to fan-out/aggregate patterns.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Three ways to run
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="runAgent()" icon="user" href="/guides/single-agent">
+    One agent, one prompt. The simplest entry point for quick tasks.
+  </Card>
+  <Card title="runTeam()" icon="users" href="/guides/team-orchestration">
+    Give a goal, the framework plans and executes with a coordinator agent.
+  </Card>
+  <Card title="runTasks()" icon="diagram-project" href="/guides/task-pipeline">
+    Define your own task graph with explicit dependencies and assignments.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Why Open Multi-Agent?
 
-## Need inspiration?
+<AccordionGroup>
+  <Accordion title="Auto task decomposition">
+    Describe a goal in plain text. A built-in coordinator agent breaks it into a task DAG with dependencies and assignees — no manual orchestration needed. Tasks that don't depend on each other run in parallel automatically.
+  </Accordion>
+  <Accordion title="Model agnostic">
+    Claude, GPT, GitHub Copilot, and local models (Ollama, vLLM, LM Studio) can work together in the same team. Set a `baseURL` to point any agent at any OpenAI-compatible endpoint.
+  </Accordion>
+  <Accordion title="In-process execution">
+    No subprocess overhead. Everything runs in one Node.js process. Deploy to serverless, Docker, or CI/CD pipelines without any infrastructure dependencies.
+  </Accordion>
+  <Accordion title="Built-in tools">
+    Five production-ready tools ship out of the box: `bash`, `file_read`, `file_write`, `file_edit`, and `grep`. Define custom tools with a Zod schema in ~10 lines of code.
+  </Accordion>
+</AccordionGroup>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Get started
+
+<Steps>
+  <Step title="Install">
+    ```bash
+    npm install @jackchen_me/open-multi-agent
+    ```
+  </Step>
+  <Step title="Set your API key">
+    ```bash
+    export ANTHROPIC_API_KEY=your-key-here
+    ```
+  </Step>
+  <Step title="Run your first team">
+    ```typescript
+    import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+
+    const orchestrator = new OpenMultiAgent({ defaultModel: 'claude-sonnet-4-6' })
+
+    const team = orchestrator.createTeam('my-team', {
+      name: 'my-team',
+      agents: [
+        { name: 'researcher', model: 'claude-sonnet-4-6', systemPrompt: 'You research topics.' },
+        { name: 'writer', model: 'claude-sonnet-4-6', systemPrompt: 'You write clear summaries.' },
+      ],
+      sharedMemory: true,
+    })
+
+    const result = await orchestrator.runTeam(team, 'Summarize the key benefits of TypeScript generics.')
+    console.log(result.agentResults.get('coordinator')?.output)
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Requires Node.js 18 or higher. See the [quickstart](/quickstart) for a complete walkthrough including all supported providers.
+</Note>

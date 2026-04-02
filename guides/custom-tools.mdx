@@ -1,0 +1,386 @@
+---
+title: "Custom Tools"
+description: "Define your own tools with Zod schemas and register them with agents"
+---
+
+`defineTool()` is the single entry-point for creating tools in Open Multi-Agent. It wraps any external service, local function, or API call in ~10 lines and makes it available to any agent that lists the tool's name in its `AgentConfig.tools` array.
+
+## Quick example
+
+The following tool fetches a live currency exchange rate and is taken directly from [`examples/04-multi-model-team.ts`](https://github.com/JackChen-me/open-multi-agent/blob/main/examples/04-multi-model-team.ts):
+
+```typescript
+import { z } from 'zod'
+import { defineTool } from '@jackchen_me/open-multi-agent'
+
+const exchangeRateTool = defineTool({
+  name: 'get_exchange_rate',
+  description:
+    'Get the current exchange rate between two currencies. ' +
+    'Returns the rate as a decimal: 1 unit of `from` = N units of `to`.',
+  inputSchema: z.object({
+    from: z.string().describe('ISO 4217 currency code, e.g. "USD"'),
+    to: z.string().describe('ISO 4217 currency code, e.g. "EUR"'),
+  }),
+  execute: async ({ from, to }) => {
+    const url = `https://api.exchangerate.host/convert?from=${from}&to=${to}&amount=1`
+    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+
+    const json = await resp.json()
+    const rate: number = json?.result ?? json?.info?.rate
+
+    return {
+      data: JSON.stringify({ from, to, rate, timestamp: new Date().toISOString() }),
+      isError: false,
+    }
+  },
+})
+```
+
+---
+
+## `defineTool()` API
+
+```typescript
+function defineTool<TInput>(config: {
+  name: string
+  description: string
+  inputSchema: ZodSchema<TInput>
+  execute: (input: TInput, context: ToolUseContext) => Promise<ToolResult>
+}): ToolDefinition<TInput>
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | `string` | Unique tool name. Agents reference it by this name in `AgentConfig.tools`. |
+| `description` | `string` | Plain-English description sent to the LLM. Be specific — the model uses this to decide when to call the tool. |
+| `inputSchema` | `ZodSchema<TInput>` | A Zod schema. Used for LLM-facing JSON Schema conversion **and** runtime input validation before `execute` is called. |
+| `execute` | `(input: TInput, context: ToolUseContext) => Promise<ToolResult>` | Implementation function. `input` is already validated against `inputSchema`. |
+
+---
+
+## Input schema with Zod
+
+The `inputSchema` field accepts any Zod schema. Use `.describe()` on individual fields to add documentation that the LLM sees in the tool's JSON Schema.
+
+```typescript
+import { z } from 'zod'
+
+const inputSchema = z.object({
+  query: z.string().describe('The search query string.'),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe('Maximum results to return. Defaults to 10.'),
+  format: z
+    .enum(['json', 'markdown'])
+    .optional()
+    .describe('Output format. Defaults to "json".'),
+})
+```
+
+The framework converts this to JSON Schema automatically via `zodToJsonSchema()` before each LLM API call. You never need to write the JSON Schema by hand.
+
+<Note>
+  `zodToJsonSchema()` is exported from `open-multi-agent` if you need the raw JSON Schema for debugging or for constructing your own LLM payloads.
+</Note>
+
+```typescript
+import { zodToJsonSchema } from '@jackchen_me/open-multi-agent'
+
+const schema = zodToJsonSchema(inputSchema)
+// {
+//   type: 'object',
+//   properties: {
+//     query: { type: 'string', description: 'The search query string.' },
+//     limit: { type: 'number', description: '...' },
+//     format: { type: 'string', enum: ['json', 'markdown'], description: '...' },
+//   },
+//   required: ['query'],
+// }
+```
+
+---
+
+## `ToolUseContext`
+
+The second argument passed to `execute` provides runtime context about who is calling the tool and the environment it is running in.
+
+```typescript
+interface ToolUseContext {
+  /** High-level description of the agent invoking this tool. */
+  agent: AgentInfo         // { name: string; role: string; model: string }
+
+  /** Present when the tool runs inside a multi-agent team. */
+  team?: TeamInfo          // { name: string; agents: string[]; sharedMemory: MemoryStore }
+
+  /** AbortSignal — check this inside long-running operations. */
+  abortSignal?: AbortSignal
+
+  /** Full AbortController when you need to programmatically abort. */
+  abortController?: AbortController
+
+  /** Working directory hint for file-system tools. */
+  cwd?: string
+
+  /** Arbitrary caller metadata (session ID, request ID, etc.). */
+  metadata?: Readonly<Record<string, unknown>>
+}
+```
+
+Use `abortSignal` to cancel network requests or stop iterating when the agent run is cancelled:
+
+```typescript
+execute: async ({ url }, context) => {
+  const resp = await fetch(url, { signal: context.abortSignal })
+  // ...
+}
+```
+
+---
+
+## `ToolResult`
+
+Every `execute` function must return a `Promise<ToolResult>`:
+
+```typescript
+interface ToolResult {
+  data: string        // string content returned to the LLM
+  isError?: boolean   // true → the LLM sees this as a tool error; defaults to false
+}
+```
+
+Always serialize structured data to a string. JSON is a good default:
+
+```typescript
+return {
+  data: JSON.stringify({ rate: 0.91, timestamp: '2026-04-02T00:00:00Z' }),
+  isError: false,
+}
+```
+
+Return `isError: true` for recoverable errors so the LLM can retry or adapt, rather than throwing an exception (which would also produce an error result but with a generic message):
+
+```typescript
+execute: async ({ from, to }) => {
+  try {
+    const rate = await fetchRate(from, to)
+    return { data: JSON.stringify({ from, to, rate }), isError: false }
+  } catch (err) {
+    return {
+      data: `Could not fetch rate for ${from}/${to}: ${err instanceof Error ? err.message : String(err)}`,
+      isError: true,
+    }
+  }
+}
+```
+
+---
+
+## Registering custom tools
+
+Custom tools must be added to a `ToolRegistry` and the registry must be injected into the `Agent`. The high-level `OpenMultiAgent` API only registers the five built-in tools, so for custom tools you construct agents manually.
+
+<Steps>
+  <Step title="Create a ToolRegistry and register tools">
+    ```typescript
+    import {
+      ToolRegistry,
+      ToolExecutor,
+      registerBuiltInTools,
+    } from '@jackchen_me/open-multi-agent'
+
+    const registry = new ToolRegistry()
+
+    // Add the five built-in tools (optional — only if you want them)
+    registerBuiltInTools(registry)
+
+    // Add your custom tools
+    registry.register(exchangeRateTool)
+    registry.register(formatCurrencyTool)
+    ```
+  </Step>
+  <Step title="Create a ToolExecutor">
+    ```typescript
+    const executor = new ToolExecutor(registry)
+    ```
+  </Step>
+  <Step title="Build the Agent with the registry and executor">
+    ```typescript
+    import { Agent } from '@jackchen_me/open-multi-agent'
+    import type { AgentConfig } from '@jackchen_me/open-multi-agent'
+
+    const config: AgentConfig = {
+      name: 'researcher',
+      model: 'claude-sonnet-4-6',
+      provider: 'anthropic',
+      systemPrompt: 'You are a financial data researcher.',
+      // List tool names the agent is allowed to call
+      tools: ['get_exchange_rate'],
+      maxTurns: 6,
+      temperature: 0,
+    }
+
+    const agent = new Agent(config, registry, executor)
+    ```
+  </Step>
+  <Step title="Run the agent">
+    ```typescript
+    const result = await agent.run('Fetch the USD to EUR exchange rate.')
+
+    console.log(result.success)   // true
+    console.log(result.output)    // LLM's final text response
+    console.log(result.toolCalls) // [{ toolName: 'get_exchange_rate', ... }]
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Real-world example: multi-model team with custom tools
+
+This pattern — taken from `examples/04-multi-model-team.ts` — shows how to build a helper function that registers both built-in and custom tools, then uses `AgentPool` to run the agents sequentially:
+
+```typescript
+import { z } from 'zod'
+import {
+  Agent,
+  AgentPool,
+  ToolRegistry,
+  ToolExecutor,
+  defineTool,
+  registerBuiltInTools,
+} from '@jackchen_me/open-multi-agent'
+import type { AgentConfig } from '@jackchen_me/open-multi-agent'
+
+// --- Define tools ---
+
+const exchangeRateTool = defineTool({
+  name: 'get_exchange_rate',
+  description: 'Get the current exchange rate between two currencies.',
+  inputSchema: z.object({
+    from: z.string().describe('ISO 4217 currency code, e.g. "USD"'),
+    to: z.string().describe('ISO 4217 currency code, e.g. "EUR"'),
+  }),
+  execute: async ({ from, to }) => {
+    // ... fetch from API
+    return { data: JSON.stringify({ from, to, rate: 0.91 }), isError: false }
+  },
+})
+
+const formatCurrencyTool = defineTool({
+  name: 'format_currency',
+  description: 'Format a number as a localised currency string.',
+  inputSchema: z.object({
+    amount: z.number().describe('The numeric amount to format.'),
+    currency: z.string().describe('ISO 4217 currency code, e.g. "USD".'),
+    locale: z.string().optional().describe('BCP 47 locale string. Defaults to "en-US".'),
+  }),
+  execute: async ({ amount, currency, locale = 'en-US' }) => {
+    const formatted = new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency,
+    }).format(amount)
+    return { data: formatted, isError: false }
+  },
+})
+
+// --- Helper: build an agent with both built-in and custom tools ---
+
+function buildCustomAgent(
+  config: AgentConfig,
+  extraTools: ReturnType<typeof defineTool>[],
+): Agent {
+  const registry = new ToolRegistry()
+  registerBuiltInTools(registry)
+  for (const tool of extraTools) {
+    registry.register(tool)
+  }
+  const executor = new ToolExecutor(registry)
+  return new Agent(config, registry, executor)
+}
+
+// --- Build agents ---
+
+const researcher = buildCustomAgent(
+  {
+    name: 'researcher',
+    model: 'claude-sonnet-4-6',
+    provider: 'anthropic',
+    systemPrompt: 'You are a financial data researcher.',
+    tools: ['get_exchange_rate'],
+    maxTurns: 6,
+    temperature: 0,
+  },
+  [exchangeRateTool],
+)
+
+const analyst = buildCustomAgent(
+  {
+    name: 'analyst',
+    model: 'gpt-4o',
+    provider: 'openai',
+    systemPrompt: 'You are a foreign exchange analyst.',
+    tools: ['format_currency'],
+    maxTurns: 4,
+    temperature: 0.3,
+  },
+  [formatCurrencyTool],
+)
+
+// --- Run with AgentPool ---
+
+const pool = new AgentPool(1) // sequential
+pool.add(researcher)
+pool.add(analyst)
+
+const researchResult = await pool.run(
+  'researcher',
+  'Fetch the USD to EUR, USD to GBP, and USD to JPY exchange rates.',
+)
+
+const analystResult = await pool.run(
+  'analyst',
+  `Given these rates: ${researchResult.output}\n\nWrite a short FX briefing.`,
+)
+```
+
+---
+
+## Testing a tool in isolation
+
+You can call `execute` directly without an agent or LLM. Pass a minimal `ToolUseContext` with just the required `agent` field:
+
+```typescript
+const result = await formatCurrencyTool.execute(
+  { amount: 1234.56, currency: 'EUR', locale: 'de-DE' },
+  { agent: { name: 'test', role: 'test', model: 'test' } },
+)
+
+console.log(result.data)    // "1.234,56 €"
+console.log(result.isError) // false
+```
+
+This makes tools easy to unit-test without spinning up an LLM.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Built-in Tools" icon="toolbox" href="/guides/built-in-tools">
+    Reference for the five tools included out of the box.
+  </Card>
+  <Card title="Tool Registry API" icon="database" href="/api/tool-registry">
+    Full `ToolRegistry` and `ToolExecutor` API reference.
+  </Card>
+  <Card title="Multi-model teams" icon="users" href="/guides/team-orchestration">
+    Run agents with different models and providers in the same team.
+  </Card>
+  <Card title="Types reference" icon="code" href="/api/types">
+    Complete type definitions for `ToolDefinition`, `ToolResult`, and `ToolUseContext`.
+  </Card>
+</CardGroup>

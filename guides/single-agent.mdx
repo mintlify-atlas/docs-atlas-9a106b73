@@ -1,0 +1,259 @@
+---
+title: "Single Agent"
+description: "Run one-shot tasks with runAgent(), drive multi-turn conversations with Agent.prompt(), and stream tokens with Agent.stream()."
+---
+
+The simplest entry point into Open Multi-Agent is a single agent. No teams, no task queues — just one agent and a prompt.
+
+<CardGroup cols={2}>
+  <Card title="runAgent()" icon="bolt" href="/api/orchestrator">
+    One-shot convenience wrapper. Builds a fresh agent, runs it, and returns the result. Minimal boilerplate.
+  </Card>
+  <Card title="Agent class" icon="cube" href="/api/agent">
+    Full control: multi-turn conversations, streaming, and lifecycle inspection.
+  </Card>
+</CardGroup>
+
+## One-shot task with `runAgent()`
+
+`OpenMultiAgent.runAgent()` is the fastest path to a working agent. Pass an `AgentConfig` and a prompt — the orchestrator handles tool registration, the agentic loop, and result packaging.
+
+```typescript
+import { OpenMultiAgent } from '@jackchen_me/open-multi-agent'
+import type { OrchestratorEvent } from 'open-multi-agent/types'
+
+const orchestrator = new OpenMultiAgent({
+  defaultModel: 'claude-sonnet-4-6',
+  onProgress: (event: OrchestratorEvent) => {
+    if (event.type === 'agent_start') {
+      console.log(`[start]    agent=${event.agent}`)
+    } else if (event.type === 'agent_complete') {
+      console.log(`[complete] agent=${event.agent}`)
+    }
+  },
+})
+
+const result = await orchestrator.runAgent(
+  {
+    name: 'coder',
+    model: 'claude-sonnet-4-6',
+    systemPrompt: `You are a focused TypeScript developer.
+When asked to implement something, write clean, minimal code with no extra commentary.
+Use the bash tool to run commands and the file tools to read/write files.`,
+    tools: ['bash', 'file_read', 'file_write'],
+    maxTurns: 8,
+  },
+  `Create a small TypeScript utility function in /tmp/greet.ts that:
+  1. Exports a function named greet(name: string): string
+  2. Returns "Hello, <name>!"
+  3. Adds a brief usage comment at the top of the file.
+  Then add a default call greet("World") at the bottom and run the file with: npx tsx /tmp/greet.ts`,
+)
+
+if (result.success) {
+  console.log('\nAgent output:')
+  console.log('─'.repeat(60))
+  console.log(result.output)
+  console.log('─'.repeat(60))
+} else {
+  console.error('Agent failed:', result.output)
+  process.exit(1)
+}
+
+console.log('\nToken usage:')
+console.log(`  input:  ${result.tokenUsage.input_tokens}`)
+console.log(`  output: ${result.tokenUsage.output_tokens}`)
+console.log(`  tool calls made: ${result.toolCalls.length}`)
+```
+
+### `AgentRunResult` fields
+
+Every agent run resolves to an `AgentRunResult`:
+
+<AccordionGroup>
+  <Accordion title="success: boolean">
+    `true` when the agent completed all turns without an unrecoverable error. `false` if the model errored, `maxTurns` was exceeded, or a tool returned a fatal failure.
+  </Accordion>
+  <Accordion title="output: string">
+    The agent's final plain-text response. On failure this contains the error message or the last partial output.
+  </Accordion>
+  <Accordion title="tokenUsage: TokenUsage">
+    Cumulative `{ input_tokens, output_tokens }` across every turn in the run.
+
+    ```typescript
+    console.log(`input:  ${result.tokenUsage.input_tokens}`)
+    console.log(`output: ${result.tokenUsage.output_tokens}`)
+    ```
+  </Accordion>
+  <Accordion title="toolCalls: ToolCallRecord[]">
+    An ordered list of every tool invocation made during the run. Each record carries `toolName`, `input`, `output`, and `duration` in milliseconds.
+
+    ```typescript
+    console.log(`tool calls made: ${result.toolCalls.length}`)
+    for (const call of result.toolCalls) {
+      console.log(`  ${call.toolName} — ${call.duration}ms`)
+    }
+    ```
+  </Accordion>
+  <Accordion title="messages: LLMMessage[]">
+    The full conversation history including user turns, assistant turns, tool-use blocks, and tool-result blocks. Useful for debugging or replaying a run.
+  </Accordion>
+</AccordionGroup>
+
+### `AgentConfig` reference
+
+| Field          | Type                                       | Description                                                                  |
+| -------------- | ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `name`         | `string`                                   | Unique identifier shown in progress events and result maps.                  |
+| `model`        | `string`                                   | Model ID, e.g. `'claude-sonnet-4-6'` or `'gpt-4o'`.                         |
+| `provider`     | `'anthropic' \| 'openai' \| 'copilot'`    | Defaults to the orchestrator's `defaultProvider`. Usually auto-detected.     |
+| `systemPrompt` | `string`                                   | Sets the agent's role and behaviour for every turn.                          |
+| `tools`        | `string[]`                                 | Named built-in tools the agent may call. See [Built-in Tools](/guides/built-in-tools). |
+| `maxTurns`     | `number`                                   | Hard limit on agentic turns before the run terminates. Prevents runaway loops.|
+| `maxTokens`    | `number`                                   | Maximum tokens per LLM response.                                             |
+| `temperature`  | `number`                                   | Sampling temperature: 0 = deterministic, 1 = creative.                       |
+| `baseURL`      | `string`                                   | Custom base URL for OpenAI-compatible APIs (Ollama, vLLM, LM Studio).        |
+| `apiKey`       | `string`                                   | API key override; falls back to the provider's standard environment variable. |
+
+<Tip>
+  Set `maxTurns` to a realistic ceiling for your task. A coding task that writes and runs files might need 8–12 turns; a simple Q&A needs 1.
+</Tip>
+
+---
+
+## Streaming with `Agent.stream()`
+
+When you need tokens as they are generated, use the `Agent` class directly. Construct a `ToolRegistry` and `ToolExecutor`, then call `.stream()`.
+
+```typescript
+import { Agent, ToolRegistry, ToolExecutor, registerBuiltInTools } from '@jackchen_me/open-multi-agent'
+
+// Build a registry with all built-in tools registered
+const registry = new ToolRegistry()
+registerBuiltInTools(registry)
+const executor = new ToolExecutor(registry)
+
+const streamingAgent = new Agent(
+  {
+    name: 'explainer',
+    model: 'claude-sonnet-4-6',
+    systemPrompt: 'You are a concise technical writer. Keep explanations brief.',
+    maxTurns: 3,
+  },
+  registry,
+  executor,
+)
+
+process.stdout.write('Streaming: ')
+
+for await (const event of streamingAgent.stream(
+  'In two sentences, explain what a TypeScript generic constraint is.',
+)) {
+  if (event.type === 'text' && typeof event.data === 'string') {
+    process.stdout.write(event.data)
+  } else if (event.type === 'done') {
+    process.stdout.write('\n')
+  } else if (event.type === 'error') {
+    console.error('\nStream error:', event.data)
+  }
+}
+```
+
+<Note>
+  `OpenMultiAgent.runAgent()` does exactly this internally — it builds a `ToolRegistry`, registers built-in tools, and constructs an `Agent`. Use the class directly only when you need streaming or fine-grained lifecycle control.
+</Note>
+
+### `StreamEvent` types
+
+| `type`        | `data`            | Description                                                       |
+| ------------- | ----------------- | ----------------------------------------------------------------- |
+| `text`        | `string`          | Incremental text delta. Write directly to stdout or a web stream. |
+| `tool_use`    | `ToolUseBlock`    | The model has begun or completed a tool-use block.                |
+| `tool_result` | `ToolResultBlock` | A tool result has been injected into the stream.                  |
+| `done`        | `LLMResponse`     | Stream ended; `data` is the full final response.                  |
+| `error`       | `Error`           | Unrecoverable error. No further events will be emitted.           |
+
+<Tip>
+  Always check for `event.type === 'error'` explicitly — an unhandled error event is silently swallowed inside a `for await` loop.
+</Tip>
+
+---
+
+## Multi-turn conversation with `Agent.prompt()`
+
+`Agent.prompt()` appends each turn to a persistent message history. The agent sees all prior context on every subsequent call.
+
+```typescript
+import { Agent, ToolRegistry, ToolExecutor } from '@jackchen_me/open-multi-agent'
+
+const conversationAgent = new Agent(
+  {
+    name: 'tutor',
+    model: 'claude-sonnet-4-6',
+    systemPrompt: 'You are a TypeScript tutor. Give short, direct answers.',
+    maxTurns: 2,
+  },
+  new ToolRegistry(), // no tools needed for this conversation
+  new ToolExecutor(new ToolRegistry()),
+)
+
+const turn1 = await conversationAgent.prompt('What is a type guard in TypeScript?')
+console.log('Turn 1:', turn1.output.slice(0, 200))
+
+// The agent remembers the previous answer
+const turn2 = await conversationAgent.prompt(
+  'Give me one concrete code example of what you just described.',
+)
+console.log('\nTurn 2:', turn2.output.slice(0, 300))
+
+// History is retained between prompt() calls
+console.log(`\nConversation history length: ${conversationAgent.getHistory().length} messages`)
+```
+
+<Steps>
+  <Step title="First prompt">
+    `prompt()` appends the user message and calls the LLM. The response is returned as an `AgentRunResult`.
+  </Step>
+  <Step title="History update">
+    The resulting assistant messages are appended to the agent's internal history.
+  </Step>
+  <Step title="Subsequent prompts">
+    All future `prompt()` calls include the full prior conversation so the agent can reference earlier turns.
+  </Step>
+  <Step title="Reset when needed">
+    Call `agent.reset()` to clear the history and return the agent to `idle` state without discarding the configuration.
+  </Step>
+</Steps>
+
+<Warning>
+  `run()` and `stream()` do **not** use or update the persistent history. Only `prompt()` accumulates context across calls.
+</Warning>
+
+---
+
+## Running the full example
+
+```bash
+ANTHROPIC_API_KEY=your_key npx tsx examples/01-single-agent.ts
+```
+
+The example runs all three patterns in sequence: `runAgent()` (one-shot), `Agent.stream()` (streaming), and `Agent.prompt()` (multi-turn).
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Team Orchestration" icon="users" href="/guides/team-orchestration">
+    Coordinate multiple specialised agents on a shared goal.
+  </Card>
+  <Card title="Task Pipeline" icon="list-checks" href="/guides/task-pipeline">
+    Define explicit task graphs with dependency chains.
+  </Card>
+  <Card title="Built-in Tools" icon="wrench" href="/guides/built-in-tools">
+    Explore bash, file I/O, grep, and other built-in tools.
+  </Card>
+  <Card title="API: Agent" icon="code" href="/api/agent">
+    Full API reference for the Agent class.
+  </Card>
+</CardGroup>
